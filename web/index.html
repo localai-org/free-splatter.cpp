@@ -26,6 +26,10 @@
   }
   #panel h1 { font-size: 14px; font-weight: 650; letter-spacing: .2px; }
   #panel .sub { color: #8b93a1; font-size: 11.5px; margin-top: 2px; }
+  #scene { width: 100%; margin-top: 10px; padding: 6px 8px; font-size: 12.5px; color: #e8eaed;
+           background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.12);
+           border-radius: 8px; cursor: pointer; }
+  #scene:hover { background: rgba(255,255,255,.1); }
   #bar { height: 6px; background: rgba(255,255,255,.08); border-radius: 99px; overflow: hidden; margin: 12px 0 8px; }
   #bar > div { height: 100%; width: 0; background: linear-gradient(90deg,#5b8cff,#8a5bff); transition: width .15s ease; }
   .stat { display: flex; justify-content: space-between; font-variant-numeric: tabular-nums; }
@@ -41,6 +45,7 @@
 <div id="panel">
   <h1>free-splatter.cpp</h1>
   <div class="sub">3D gaussian scene from 2 photos — CPU/Vulkan engine, WebGL render.</div>
+  <select id="scene" title="pick a scene"></select>
   <div id="bar"><div></div></div>
   <div class="stat"><span>loaded</span><span id="s-loaded">0%</span></div>
   <div class="stat"><span>splats</span><span id="s-splats">0</span></div>
@@ -50,10 +55,28 @@
 <div id="hint">drag to orbit · scroll to zoom · WASD/arrows to move</div>
 
 <script type="module">
-const SPLAT_URL = new URLSearchParams(location.search).get("splat") || "scene.splat";
+const SPLAT_URL = new URLSearchParams(location.search).get("splat") || "blendedmvs_1.splat";
 const ROW = 32;                       // bytes per splat
 const $ = (id) => document.getElementById(id);
 const setStatus = (t, err=false) => { const s=$("status"); s.textContent=t; s.classList.toggle("err",err); };
+
+// Scene selector: populate from scenes.json (a list of {file,label}); switching
+// reloads with ?splat=. Hidden if the manifest is absent.
+(async () => {
+  const sel = $("scene");
+  try {
+    const list = await (await fetch("scenes.json")).json();
+    for (const s of list) {
+      const o = document.createElement("option");
+      o.value = s.file; o.textContent = s.label;
+      if (s.file === SPLAT_URL) o.selected = true;
+      sel.appendChild(o);
+    }
+    if (!list.some(s => s.file === SPLAT_URL)) { const o=document.createElement("option");
+      o.value=SPLAT_URL; o.textContent="(custom)"; o.selected=true; sel.appendChild(o); }
+    sel.onchange = () => { location.search = "?splat=" + encodeURIComponent(sel.value); };
+  } catch { sel.style.display = "none"; }
+})();
 
 const canvas = $("gl");
 const gl = canvas.getContext("webgl2", { antialias: false, premultipliedAlpha: true, alpha: false });
@@ -247,7 +270,7 @@ function requestSort(view) {
 // sharpest (softer from the side).
 const _p = new URLSearchParams(location.search);
 let target = [parseFloat(_p.get("tx")??"0"), parseFloat(_p.get("ty")??"0"), parseFloat(_p.get("tz")??"0")];
-let yaw   = parseFloat(_p.get("yaw")  ?? "3.14");
+let yaw   = parseFloat(_p.get("yaw")  ?? "0.0");
 let pitch = parseFloat(_p.get("pitch")?? "0.05");
 let dist  = parseFloat(_p.get("dist") ?? "2.0");
 let framed = false;

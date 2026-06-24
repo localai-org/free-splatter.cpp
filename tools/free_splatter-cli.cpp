@@ -73,12 +73,15 @@ static bool write_splat(const float * g, size_t n, int gc, float opac_thr,
     auto u8 = [](float v) -> unsigned char { float t = v < 0 ? 0 : v > 255 ? 255 : v; return (unsigned char) t; };
     for (size_t k = 0; k < m; k++) {
         const float * x = &g[keep[k].second * gc];
-        float pos[3]   = { x[0], x[1], x[2] };
+        // FreeSplatter's reference frame is OpenCV (y down, z forward); convert
+        // to the viewer's OpenGL convention (y up) via a 180deg rotation about X
+        // = diag(1,-1,-1): position.yz negate, quaternion (w,x,y,z)->(-x,w,-z,y).
+        float pos[3]   = { x[0], -x[1], -x[2] };
         float scale[3] = { x[16], x[17], x[18] };
         unsigned char rgba[4], rot[4];
         for (int c = 0; c < 3; c++) { float v = 0.5f + (float) C0 * x[3+c]; rgba[c] = u8((v<0?0:v>1?1:v) * 255.0f); }
         rgba[3] = u8(std::min(std::max(x[15], 0.0f), 1.0f) * 255.0f);
-        float q[4] = { x[19], x[20], x[21], x[22] };
+        float q[4] = { -x[20], x[19], -x[22], x[21] };
         float nrm = std::sqrt(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]) + 1e-12f;
         for (int c = 0; c < 4; c++) rot[c] = u8(q[c]/nrm * 128.0f + 128.0f);
         f.write((const char *) pos, 12);

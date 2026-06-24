@@ -47,6 +47,10 @@ def main() -> int:
 
     rgb = np.clip(0.5 + C0 * dc, 0.0, 1.0)
     rgba = np.concatenate([rgb, opac[:, None]], axis=1)
+    # OpenCV (y down, z forward) -> OpenGL (y up): 180deg about X = diag(1,-1,-1).
+    xyz = xyz * np.array([1.0, -1.0, -1.0], dtype=np.float32)
+    w, x, y, z = rot[:, 0], rot[:, 1], rot[:, 2], rot[:, 3]   # (w,x,y,z)
+    rot = np.stack([-x, w, -z, y], axis=1)                    # (-x, w, -z, y)
     rot = rot / (np.linalg.norm(rot, axis=1, keepdims=True) + 1e-12)
 
     dt = np.dtype([("pos", "<f4", 3), ("scale", "<f4", 3),

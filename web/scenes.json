@@ -1,0 +1,10 @@
+[
+  {"file": "blendedmvs_1.splat", "label": "Aerial city — BlendedMVS"},
+  {"file": "re10k_2.splat",      "label": "Aerial suburb — RealEstate10K"},
+  {"file": "co3d_1.splat",       "label": "Teddy bear — CO3D"},
+  {"file": "dtu_1.splat",        "label": "Bunny — DTU"},
+  {"file": "scannetpp_1.splat",  "label": "Office — ScanNet++"},
+  {"file": "re10k_1.splat",      "label": "Living room — RealEstate10K"},
+  {"file": "wild_1.splat",       "label": "Indoor — in the wild"},
+  {"file": "scannetpp_2.splat",  "label": "Room — ScanNet++"}
+]
