@@ -198,6 +198,7 @@ function ingest(bytes, total) {
   count = n;
   uploadTexture();
   $("s-splats").textContent = count.toLocaleString();
+  if (count > 5000) frameToData();   // auto-frame once enough splats are in
 }
 
 // ---------- depth-sort worker ----------
@@ -239,14 +240,26 @@ function requestSort(view) {
 }
 
 // ---------- camera (orbit + zoom + WASD) ----------
-const target = [-0.26, -0.13, 0.42];   // scene center (from gaussian stats)
-// initial camera (overridable via ?yaw=&pitch=&dist= for shareable views)
+// initial camera (overridable via ?yaw=&pitch=&dist=&tx=&ty=&tz= for shareable
+// views). target + dist auto-frame to the loaded splats unless overridden, so
+// the viewer works for any scene without a hardcoded center. Default look
+// direction is the reference view, where 2-view pixel-aligned splats are
+// sharpest (softer from the side).
 const _p = new URLSearchParams(location.search);
-// default to the reference-view direction: 2-view pixel-aligned splats are
-// sharpest looking along the input views, softer from the side.
+let target = [parseFloat(_p.get("tx")??"0"), parseFloat(_p.get("ty")??"0"), parseFloat(_p.get("tz")??"0")];
 let yaw   = parseFloat(_p.get("yaw")  ?? "3.14");
 let pitch = parseFloat(_p.get("pitch")?? "0.05");
-let dist  = parseFloat(_p.get("dist") ?? "1.8");
+let dist  = parseFloat(_p.get("dist") ?? "2.0");
+let framed = false;
+function frameToData() {
+  if (framed || count === 0) return;
+  let lo = [1e30,1e30,1e30], hi = [-1e30,-1e30,-1e30];
+  for (let i=0;i<count;i++) for (let k=0;k<3;k++){ const v=positions[i*3+k]; if(v<lo[k])lo[k]=v; if(v>hi[k])hi[k]=v; }
+  const diag = Math.hypot(hi[0]-lo[0], hi[1]-lo[1], hi[2]-lo[2]);
+  if (!_p.has("tx"))   target = [(lo[0]+hi[0])/2, (lo[1]+hi[1])/2, (lo[2]+hi[2])/2];
+  if (!_p.has("dist")) dist = Math.max(0.5, 0.7*diag);
+  framed = true; sortDirty = true;
+}
 const keys = {};
 addEventListener("keydown", e => keys[e.key.toLowerCase()] = true);
 addEventListener("keyup",   e => keys[e.key.toLowerCase()] = false);
