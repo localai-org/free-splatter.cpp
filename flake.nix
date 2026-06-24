@@ -30,6 +30,8 @@
             pkgs.vulkan-loader
             pkgs.vulkan-headers
             pkgs.shaderc
+            # headless browser for screenshotting the WebGL demo (web/)
+            pkgs.chromium
           ];
           # Let pip-installed PyTorch/numpy wheels (used by scripts/, in a
           # .venv-torch) find their shared libs. The wheels are manylinux and

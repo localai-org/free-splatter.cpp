@@ -40,3 +40,6 @@ timeout-*
 # Stray emscripten compiler-probe outputs
 /a.out.js
 /a.out.wasm
+
+# Generated demo splats
+/web/*.splat
