@@ -29,16 +29,19 @@ No Nix? You just need CMake, a C++17 compiler, and the bundled `ggml` submodule
 ## Run
 
 ```sh
-free_splatter-cli model.gguf images.f32
+free_splatter-cli --device vulkan --splat scene.splat model.gguf view1.jpg view2.jpg
 ```
 
 - `model.gguf` — the model weights (see Releases).
-- `images.f32` — your input views as raw 32-bit floats in `[0,1]`, laid out one
-  view after another, each view as channels-then-rows-then-columns (RGB,
-  512×512). The number of views is detected automatically.
+- the input views — ordinary image files (JPG/PNG/…); each is center-cropped and
+  resized to 512×512. (Or pass one raw `.f32` file: views as 32-bit floats in
+  `[0,1]`, view-major channels-then-rows-then-columns.)
+- `--splat scene.splat` — write a gaussian-splat file for the `web/` viewer
+  (`--max-splats N` caps the count, `--opacity-threshold T` prunes faint ones);
+  `--out result.f32` saves the raw per-pixel gaussians instead.
+- `--device vulkan` runs on a GPU (~seconds); the default CPU works everywhere.
 
-The output is one Gaussian per pixel per view. Use `--out result.f32` to save it,
-`--device vulkan` to run on a GPU.
+See `web/README.md` to view the `.splat` in the browser.
 
 ## License
 

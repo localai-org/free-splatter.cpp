@@ -83,10 +83,12 @@ set_target_properties(free_splatter PROPERTIES C_VISIBILITY_PRESET hidden
                                                CXX_VISIBILITY_PRESET hidden)
 
 if (FREE_SPLATTER_BUILD_TOOLS AND NOT EMSCRIPTEN)
-    add_executable(free_splatter-cli tools/free_splatter-cli.cpp)
+    add_executable(free_splatter-cli tools/free_splatter-cli.cpp tools/stb_impl.cpp)
     target_link_libraries(free_splatter-cli PRIVATE free_splatter)
-    target_include_directories(free_splatter-cli PRIVATE src)
+    target_include_directories(free_splatter-cli PRIVATE src ${CMAKE_SOURCE_DIR}/third_party/stb)
     target_compile_options(free_splatter-cli PRIVATE -Wall -Wextra)
+    # the vendored stb headers are warning-noisy; build that TU quietly
+    set_source_files_properties(tools/stb_impl.cpp PROPERTIES COMPILE_OPTIONS "-w")
 
     add_executable(free_splatter-bench bench/free_splatter-bench.cpp)
     target_link_libraries(free_splatter-bench PRIVATE free_splatter)
