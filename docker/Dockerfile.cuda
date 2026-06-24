@@ -1,0 +1,32 @@
+# Reference-generation environment (the one piece the C++/ggml engine never
+# needs). Runs the upstream TencentARC/FreeSplatter model on GPU to (1) dump
+# float64 reference taps for per-layer parity and (2) convert weights to GGUF.
+# The engine itself builds + runs under Nix (CPU/Vulkan); this heavyweight
+# CUDA+PyTorch stack stays isolated here.
+#
+# Build:  docker build -f docker/Dockerfile.cuda -t free-splatter-ref .
+# Use:    docker run --gpus all -v $PWD:/work -w /work free-splatter-ref \
+#           python scripts/convert.py /ckpt/freesplatter-scene.safetensors out.gguf
+#         docker run --gpus all -v $PWD:/work -w /work free-splatter-ref \
+#           python scripts/hf_dump.py --ckpt /ckpt/... --out tests/fixtures/hf --views 2
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv git build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# CUDA-matched PyTorch + the conversion/dump deps.
+RUN pip3 install --no-cache-dir \
+        torch torchvision --index-url https://download.pytorch.org/whl/cu121 \
+    && pip3 install --no-cache-dir \
+        numpy "gguf>=0.10" safetensors omegaconf einops
+
+# TODO(M1): fetch the upstream FreeSplatter repo so hf_dump.py can import the
+# model definition. Pieces 1-3 (transformer + head) do NOT need the CUDA
+# rasterizer, so the diff-gaussian / diff-surfel wheels are intentionally NOT
+# installed here unless the model __init__ requires them.
+#   RUN git clone https://github.com/TencentARC/FreeSplatter /opt/FreeSplatter
+#   ENV PYTHONPATH=/opt/FreeSplatter:$PYTHONPATH
+
+WORKDIR /work

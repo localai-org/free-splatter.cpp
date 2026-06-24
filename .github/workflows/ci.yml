@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Tier 1: fast, asset-free. Build with ASan/UBSan and run the golden-op + unit
+  # tier (ctest -LE model). No model weights, no fixtures, no Python.
+  fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+      - name: Configure (debug, ASan/UBSan)
+        run: cmake --preset debug -G Ninja
+      - name: Build
+        run: cmake --build --preset debug
+      - name: Test (asset-free tier)
+        run: ctest --preset debug -LE model --output-on-failure
+
+  # Tier 2 (per-layer parity vs PyTorch) lands in M1: a separate job builds the
+  # CUDA reference image (docker/Dockerfile.cuda), dumps fixtures + converts
+  # weights, then runs `ctest -L model`. Fuzz smoke (clang) lands in M5.

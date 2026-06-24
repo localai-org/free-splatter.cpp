@@ -1,0 +1,15 @@
+// Configuration for free_splatter_load, behind an ABI-stable builder so new
+// knobs are new setters, never struct-layout changes across the C boundary.
+#pragma once
+
+#include <string>
+
+namespace free_splatter {
+
+struct options {
+    std::string device       = "cpu";  // "" | cpu | gpu | cuda | vulkan [:N]
+    int         n_threads    = 0;       // <= 0 => auto (CPU)
+    std::string dump_taps_dir;          // empty => tap dumping disabled
+};
+
+} // namespace free_splatter

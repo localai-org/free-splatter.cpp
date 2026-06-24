@@ -1,0 +1,71 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "debug",
+      "binaryDir": "${sourceDir}/build/debug",
+      "description": "AddressSanitizer + UBSan. The verification preset.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g",
+        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined"
+      }
+    },
+    {
+      "name": "release",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "release-portable",
+      "binaryDir": "${sourceDir}/build/release-portable",
+      "description": "Portable + fast CPU: build every ggml-cpu ISA variant and pick the best at runtime. Avoids -march=native (fragile, and stripped by Nix's NIX_ENFORCE_NO_NATIVE).",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "GGML_NATIVE": "OFF",
+        "GGML_BACKEND_DL": "ON",
+        "GGML_CPU_ALL_VARIANTS": "ON",
+        "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "${sourceDir}/build/release-portable/bin"
+      }
+    },
+    {
+      "name": "vulkan",
+      "binaryDir": "${sourceDir}/build/vulkan",
+      "description": "Release build with the ggml Vulkan backend (GPU parity).",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "FREE_SPLATTER_VULKAN": "ON"
+      }
+    },
+    {
+      "name": "profile",
+      "binaryDir": "${sourceDir}/build/profile",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    },
+    {
+      "name": "fuzz",
+      "binaryDir": "${sourceDir}/build/fuzz",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "FREE_SPLATTER_FUZZ": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug",            "configurePreset": "debug" },
+    { "name": "release",          "configurePreset": "release" },
+    { "name": "release-portable", "configurePreset": "release-portable" },
+    { "name": "vulkan",           "configurePreset": "vulkan" },
+    { "name": "profile",          "configurePreset": "profile" },
+    { "name": "fuzz",             "configurePreset": "fuzz" }
+  ],
+  "testPresets": [
+    { "name": "debug",            "configurePreset": "debug",            "output": { "outputOnFailure": true } },
+    { "name": "release",          "configurePreset": "release",          "output": { "outputOnFailure": true } },
+    { "name": "release-portable", "configurePreset": "release-portable", "output": { "outputOnFailure": true } },
+    { "name": "vulkan",           "configurePreset": "vulkan",           "output": { "outputOnFailure": true } }
+  ]
+}
