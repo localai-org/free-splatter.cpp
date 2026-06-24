@@ -14,7 +14,10 @@ free_splatter_add_test(test_loader)        # GGUF KV/hparams round-trip
 free_splatter_add_test(test_graph_blocks)  # golden-op pins (ggml ops we depend on)
 free_splatter_add_test(test_image)         # untrusted image-input validation
 
-# Per-layer parity vs PyTorch lands in M1 (needs converted weights + fixtures):
-#   free_splatter_add_test(test_parity)
-#   set_tests_properties(test_parity PROPERTIES LABELS "model"
-#       ENVIRONMENT "FREE_SPLATTER_FIXTURES=${CMAKE_SOURCE_DIR}/tests/fixtures/hf")
+# Per-layer parity vs the float64 PyTorch reference. Labelled "model": runs only
+# under `ctest -L model` and self-skips (77) unless FREE_SPLATTER_GGUF and
+# FREE_SPLATTER_FIXTURES are set. Needs a converted gguf + scripts/hf_dump.py
+# fixtures (see CLAUDE.md). Full-depth is heavy (~15 GB / minutes); set
+# FREE_SPLATTER_MAX_BLOCKS for a fast piece-1 + block-0 subset.
+free_splatter_add_test(test_parity)
+set_tests_properties(test_parity PROPERTIES LABELS "model")

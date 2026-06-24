@@ -79,8 +79,9 @@ rasterizer.
 - `nix develop` then `cmake --preset debug && cmake --build --preset debug` —
   ASan/UBSan, the verification build.
 - `ctest --preset debug -LE model` — fast, asset-free tier (golden-op + unit).
-- `FREE_SPLATTER_GGUF_DIR=… FREE_SPLATTER_FIXTURES=… ctest -L model` — full
-  per-layer parity (needs converted weights + fixtures).
+- `FREE_SPLATTER_GGUF=…f32.gguf FREE_SPLATTER_FIXTURES=…/2view ctest -L model` —
+  full per-layer + head parity (needs converted weights + fixtures;
+  `FREE_SPLATTER_MAX_BLOCKS=1` for a fast piece-1 + block-0 subset).
 - `cmake --preset vulkan` — Vulkan backend parity.
 - `docker/Dockerfile.cuda` is the **only** place the upstream PyTorch model runs
   (reference taps + weight conversion). The engine never depends on torch/CUDA.
