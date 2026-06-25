@@ -11,6 +11,8 @@ build-*/
 # Python
 .venv/
 .venv-torch/
+.venv-bgremove/
+.venv-rembg/
 __pycache__/
 *.pyc
 
@@ -43,3 +45,7 @@ timeout-*
 
 # Generated demo splats
 /web/*.splat
+
+# Go web-app server: locally-built binary (source + go.mod/go.sum are tracked)
+/server/fsserver
+/server/server
