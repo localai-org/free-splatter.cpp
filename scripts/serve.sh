@@ -37,10 +37,11 @@ MODELS="scene=$GGUF"
 
 ARGS=(-addr "$ADDR" -lib "$LIB" -models "$MODELS" -device "$DEVICE")
 
-# serve the demo-video storyboard page (/demo.html) when assets have been baked
-# (scripts/demo/bake.sh writes them here). Harmless if absent.
+# always mount the demo-video dir; the storyboard page (/demo.html) lights up once
+# scripts/demo/bake.sh has populated it — no server restart needed.
 DEMO_DIR=${FREE_SPLATTER_DEMO_DIR:-$ROOT/.cache/demo}
-[ -f "$DEMO_DIR/manifest.json" ] && ARGS+=(-demo-dir "$DEMO_DIR")
+mkdir -p "$DEMO_DIR"
+ARGS+=(-demo-dir "$DEMO_DIR")
 
 # auto-enable object background removal if the rembg venv exists
 # (set up once with scripts/setup_bgremove.sh).
