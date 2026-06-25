@@ -21,6 +21,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -51,11 +52,18 @@ type server struct {
 	order       []string // model names in load order; order[0] is the default
 	opts        options
 	bgRemoveCmd string // external matting command ("" = feature disabled)
+	demoDir     string // static dir served at /demo-assets/ (manifest + splats + images); "" = off
+	workDir     string // scratch root for demo video frames + encoded MP4s
 
 	mu      sync.Mutex
 	results map[string][]byte
 	order2  []string
 	counter int64
+}
+
+func respondJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(v)
 }
 
 type options struct {
@@ -242,10 +250,12 @@ func main() {
 	models := flag.String("models", "scene=../.cache/freesplatter-scene-f16.gguf",
 		"comma list of name=path GGUFs to load (first is the default), e.g. scene=a.gguf,object=b.gguf")
 	device := flag.String("device", "vulkan", "compute device: cpu | vulkan | vulkan:N")
-	maxSplats := flag.Int("max-splats", 300000, "cap on splats returned (0 = all)")
+	maxSplats := flag.Int("max-splats", 1000000, "cap on splats returned (0 = all)")
 	opacThr := flag.Float64("opacity-threshold", 5e-3, "prune gaussians with opacity <= this")
 	bgCmd := flag.String("bgremove-cmd", "",
 		"external background-removal command for the object path ({in}/{out} are batch dirs), e.g. 'rembg p -m u2netp {in} {out}'")
+	demoDir := flag.String("demo-dir", "", "directory of baked demo assets (manifest.json + .splat + images) served at /demo-assets/")
+	workDir := flag.String("work-dir", filepath.Join(os.TempDir(), "freesplatter-demo"), "scratch root for demo video frames + encoded MP4s")
 	flag.Parse()
 
 	libAbs, _ := filepath.Abs(*lib)
@@ -260,10 +270,16 @@ func main() {
 	if len(names) == 0 {
 		log.Fatal("no models specified (see -models)")
 	}
+	demoAbs := ""
+	if *demoDir != "" {
+		demoAbs, _ = filepath.Abs(*demoDir)
+	}
 	s := &server{
 		models:      map[string]*Engine{},
 		opts:        options{maxSplats: *maxSplats, opacThr: float32(*opacThr)},
 		bgRemoveCmd: *bgCmd,
+		demoDir:     demoAbs,
+		workDir:     *workDir,
 		results:     map[string][]byte{},
 	}
 	if *bgCmd != "" {
@@ -289,6 +305,14 @@ func main() {
 	mux.HandleFunc("/api/models", s.handleModels)
 	mux.HandleFunc("/api/reconstruct", s.handleReconstruct)
 	mux.HandleFunc("/api/splat/", s.handleSplat)
+	mux.HandleFunc("/api/demo/clear", s.handleDemoClear)
+	mux.HandleFunc("/api/demo/frame", s.handleDemoFrame)
+	mux.HandleFunc("/api/demo/encode", s.handleDemoEncode)
+	mux.HandleFunc("/api/demo/video/", s.handleDemoVideo)
+	if s.demoDir != "" {
+		mux.Handle("/demo-assets/", http.StripPrefix("/demo-assets/", http.FileServer(http.Dir(s.demoDir))))
+		log.Printf("serving demo assets from %s at /demo-assets/ (work dir %s)", s.demoDir, s.workDir)
+	}
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 
 	log.Printf("serving %d model(s) %v on http://localhost%s", len(s.order), s.order, *addr)

@@ -49,3 +49,6 @@ timeout-*
 # Go web-app server: locally-built binary (source + go.mod/go.sum are tracked)
 /server/fsserver
 /server/server
+
+# Demo-video drop folder (user photos; baked into .cache/demo)
+/demo-photos/

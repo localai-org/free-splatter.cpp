@@ -1,0 +1,550 @@
+<!doctype html>
+<!--
+  free-splatter.cpp demo-video renderer (storyboard page).
+  A *separate* page from index.html: it reuses the EWA splat shaders but adds a
+  shared-world layout (several baked scenes/objects placed along an axis), animated
+  source-image billboards (zoom in on the photos, then shrink them to the upper-right
+  while the splats build up), a deterministic frame-stepped timeline (camera pan +
+  zoom keyframes), and an offline capture mode that streams frames to the Go server
+  for ffmpeg assembly.
+
+  Content + storyboard come from /demo-assets/manifest.json (produced by
+  scripts/demo/bake.sh). Render on the real GPU by opening this page in a normal
+  browser and pressing "Render"; render headless (CI) by loading
+  /demo.html?capture=1&session=demo&w=1280&h=720 in chromium-swiftshader.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>free-splatter.cpp — demo render</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #07090c; overflow: hidden; font-family: ui-sans-serif, system-ui, sans-serif; color: #e8eaed; }
+  #gl { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  .card { position: fixed; top: 16px; left: 16px; z-index: 10; width: 280px; padding: 14px 16px;
+    background: rgba(16,19,24,.86); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,.08);
+    border-radius: 14px; box-shadow: 0 10px 40px rgba(0,0,0,.5); font-size: 13px; line-height: 1.45; }
+  h1 { font-size: 14px; font-weight: 660; }
+  .sub { color: #8b93a1; font-size: 11.5px; margin-top: 2px; }
+  .btn { margin-top: 12px; width: 100%; padding: 10px; font-size: 13px; font-weight: 640; color: #fff; cursor: pointer;
+    border: none; border-radius: 10px; background: linear-gradient(90deg,#5b8cff,#8a5bff); }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .row { display: flex; gap: 8px; margin-top: 10px; align-items: center; }
+  select, .mini { font-size: 11.5px; color: #e8eaed; background: rgba(255,255,255,.06);
+    border: 1px solid rgba(255,255,255,.12); border-radius: 8px; padding: 6px 8px; }
+  #scrub { width: 100%; accent-color: #6f9bff; margin-top: 10px; }
+  #status { margin-top: 9px; color: #9fd3a0; font-size: 11.5px; min-height: 1.2em; }
+  #status.err { color: #ff8a8a; }
+  a.dl { color: #8ab4ff; }
+  label.ck { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: #8b93a1; margin-top: 8px; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+
+<div class="card" id="ui">
+  <h1>free-splatter.cpp · demo render</h1>
+  <div class="sub" id="sub">loading storyboard…</div>
+  <div class="row">
+    <select id="res" class="mini" title="output resolution">
+      <option value="1920x1080">1920×1080 · 16:9</option>
+      <option value="1280x720">1280×720 · 16:9</option>
+      <option value="1080x1080">1080×1080 · 1:1</option>
+      <option value="1080x1920">1080×1920 · 9:16</option>
+    </select>
+    <label class="ck"><input type="checkbox" id="play" checked/> preview</label>
+  </div>
+  <input id="scrub" type="range" min="0" max="1000" value="0"/>
+  <button id="render" class="btn">● Render video</button>
+  <div id="status">…</div>
+</div>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const P = new URLSearchParams(location.search);
+const setStatus = (t, err=false) => { const s=$("status"); s.innerHTML=t; s.classList.toggle("err",err); };
+addEventListener("error", e => setStatus("error: "+(e.message||e), true));
+const smooth = (u) => { u = Math.max(0, Math.min(1, u)); return u*u*(3-2*u); };
+const lerp = (a,b,u) => a+(b-a)*u;
+const lerp3 = (a,b,u) => [lerp(a[0],b[0],u), lerp(a[1],b[1],u), lerp(a[2],b[2],u)];
+
+const canvas = $("gl");
+const gl = canvas.getContext("webgl2", { antialias:false, premultipliedAlpha:true, alpha:false, preserveDrawingBuffer:true });
+if (!gl) { setStatus("WebGL2 not available", true); throw new Error("no webgl2"); }
+
+// ---------- splat (EWA) program ----------
+const SPLAT_VERT = `#version 300 es
+precision highp float; precision highp int;
+uniform highp usampler2D u_tex;
+uniform mat4 u_proj, u_view;
+uniform vec2 u_focal, u_viewport;
+in vec2 a_corner;
+in uint a_index;
+out vec4 v_color; out vec2 v_pos;
+void main() {
+  uint t = a_index * 2u;
+  ivec2 wh = textureSize(u_tex, 0);
+  uvec4 A = texelFetch(u_tex, ivec2(int(t % uint(wh.x)), int(t / uint(wh.x))), 0);
+  uvec4 B = texelFetch(u_tex, ivec2(int((t+1u) % uint(wh.x)), int((t+1u) / uint(wh.x))), 0);
+  vec3 center = uintBitsToFloat(A.xyz);
+  vec3 scale  = vec3(uintBitsToFloat(A.w), uintBitsToFloat(B.x), uintBitsToFloat(B.y));
+  uint rgba = B.z, rotp = B.w;
+  v_color = vec4(float(rgba & 0xffu), float((rgba>>8)&0xffu), float((rgba>>16)&0xffu), float((rgba>>24)&0xffu)) / 255.0;
+  vec4 q = (vec4(float(rotp&0xffu), float((rotp>>8)&0xffu), float((rotp>>16)&0xffu), float((rotp>>24)&0xffu)) - 128.0) / 128.0;
+  q = normalize(q);
+  float w=q.x, x=q.y, y=q.z, z=q.w;
+  mat3 R = mat3(1.-2.*(y*y+z*z), 2.*(x*y+w*z), 2.*(x*z-w*y),
+               2.*(x*y-w*z), 1.-2.*(x*x+z*z), 2.*(y*z+w*x),
+               2.*(x*z+w*y), 2.*(y*z-w*x), 1.-2.*(x*x+y*y));
+  mat3 S = mat3(scale.x,0.,0., 0.,scale.y,0., 0.,0.,scale.z);
+  mat3 M = R * S; mat3 cov3d = M * transpose(M);
+  vec4 cam = u_view * vec4(center, 1.0);
+  if (cam.z >= -0.2) { gl_Position = vec4(0.,0.,2.,1.); return; }
+  vec4 clip = u_proj * cam;
+  if (clip.w <= 0.0 || abs(clip.x) > 1.3*clip.w || abs(clip.y) > 1.3*clip.w) { gl_Position = vec4(0.,0.,2.,1.); return; }
+  mat3 J = mat3(u_focal.x/cam.z, 0., -(u_focal.x*cam.x)/(cam.z*cam.z),
+                0., -u_focal.y/cam.z, (u_focal.y*cam.y)/(cam.z*cam.z), 0.,0.,0.);
+  mat3 W = transpose(mat3(u_view));
+  mat3 T = W * J; mat3 cov2 = transpose(T) * cov3d * T;
+  float a = cov2[0][0]+0.3, b = cov2[0][1], c = cov2[1][1]+0.3;
+  float det = a*c-b*b; if (det <= 0.0) { gl_Position = vec4(0.,0.,2.,1.); return; }
+  float mid = 0.5*(a+c); float rad = sqrt(max(0.,mid*mid-det));
+  float l1 = mid+rad, l2 = max(mid-rad,0.1);
+  vec2 d = vec2(b, l1-a);
+  vec2 e1 = (dot(d,d)>1e-9) ? normalize(d) : vec2(1.,0.);
+  float MAXPX = 0.20 * min(u_viewport.x, u_viewport.y);
+  vec2 v1 = min(sqrt(2.*l1), MAXPX) * e1;
+  vec2 v2 = min(sqrt(2.*l2), MAXPX) * vec2(e1.y, -e1.x);
+  vec2 ndc = clip.xy/clip.w;
+  vec2 offset = (a_corner.x*v1 + a_corner.y*v2) / u_viewport * 2.0;
+  v_pos = a_corner;
+  gl_Position = vec4(ndc + offset, clip.z/clip.w, 1.0);
+}`;
+const SPLAT_FRAG = `#version 300 es
+precision highp float;
+uniform float u_sat;
+in vec4 v_color; in vec2 v_pos; out vec4 o;
+void main() {
+  float p = -dot(v_pos, v_pos);
+  if (p < -4.0) discard;
+  float alpha = exp(p) * v_color.a;
+  vec3 rgb = v_color.rgb;
+  float luma = dot(rgb, vec3(0.2126,0.7152,0.0722));
+  rgb = clamp(mix(vec3(luma), rgb, u_sat), 0.0, 1.0);
+  o = vec4(rgb * alpha, alpha);
+}`;
+
+// ---------- image/text quad program ----------
+const IMG_VERT = `#version 300 es
+precision highp float;
+uniform vec4 u_rect;     // cx, cy, halfW, halfH  (NDC)
+in vec2 a_uv; out vec2 v_uv;
+void main(){ v_uv = a_uv; vec2 p = u_rect.xy + (a_uv*2.0-1.0)*u_rect.zw; gl_Position = vec4(p,0.0,1.0); }`;
+const IMG_FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D u_img; uniform float u_alpha; uniform float u_border;
+in vec2 v_uv; out vec4 o;
+void main(){
+  vec4 c = texture(u_img, vec2(v_uv.x, 1.0 - v_uv.y));   // textures are premultiplied
+  vec2 dd = min(v_uv, 1.0 - v_uv);
+  float edge = (u_border > 0.5 && min(dd.x, dd.y) < 0.012) ? 1.0 : 0.0;
+  o = mix(c, vec4(1.0), edge) * u_alpha;
+}`;
+
+function compile(type, src){ const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+function link(vs, fs){ const p=gl.createProgram(); gl.attachShader(p,compile(gl.VERTEX_SHADER,vs));
+  gl.attachShader(p,compile(gl.FRAGMENT_SHADER,fs)); gl.linkProgram(p);
+  if(!gl.getProgramParameter(p,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p)); return p; }
+const splatProg = link(SPLAT_VERT, SPLAT_FRAG);
+const imgProg = link(IMG_VERT, IMG_FRAG);
+
+const SU = {
+  proj: gl.getUniformLocation(splatProg,"u_proj"), view: gl.getUniformLocation(splatProg,"u_view"),
+  focal: gl.getUniformLocation(splatProg,"u_focal"), viewport: gl.getUniformLocation(splatProg,"u_viewport"),
+  sat: gl.getUniformLocation(splatProg,"u_sat"), tex: gl.getUniformLocation(splatProg,"u_tex"),
+};
+const IU = {
+  rect: gl.getUniformLocation(imgProg,"u_rect"), alpha: gl.getUniformLocation(imgProg,"u_alpha"),
+  border: gl.getUniformLocation(imgProg,"u_border"), img: gl.getUniformLocation(imgProg,"u_img"),
+};
+
+// geometry buffers + VAOs (isolate attrib/divisor state per program)
+const cornerBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, cornerBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-2,-2, 2,-2, 2,2, -2,-2, 2,2, -2,2]), gl.STATIC_DRAW);
+const uvBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,0, 1,0, 1,1, 0,0, 1,1, 0,1]), gl.STATIC_DRAW);
+
+const aCorner = gl.getAttribLocation(splatProg, "a_corner");
+const aIndex = gl.getAttribLocation(splatProg, "a_index");
+const vaoSplat = gl.createVertexArray(); gl.bindVertexArray(vaoSplat);
+gl.bindBuffer(gl.ARRAY_BUFFER, cornerBuf); gl.enableVertexAttribArray(aCorner);
+gl.vertexAttribPointer(aCorner, 2, gl.FLOAT, false, 0, 0);
+gl.enableVertexAttribArray(aIndex); gl.vertexAttribDivisor(aIndex, 1);   // a_index buffer bound per-cloud
+
+const aUV = gl.getAttribLocation(imgProg, "a_uv");
+const vaoImg = gl.createVertexArray(); gl.bindVertexArray(vaoImg);
+gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf); gl.enableVertexAttribArray(aUV);
+gl.vertexAttribPointer(aUV, 2, gl.FLOAT, false, 0, 0);
+gl.bindVertexArray(null);
+
+gl.disable(gl.DEPTH_TEST);
+gl.enable(gl.BLEND);
+gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+// NB: premultiply is enabled *only* around the photo/text uploads in texFromImage —
+// NEVER globally, or it would (try to) premultiply the integer RGBA32UI splat-data
+// texture in makeCloud, which corrupts the bits (and hangs software rasterisers).
+
+const TEX_W = 2048;
+let saturation = parseFloat(P.get("sat") ?? "1.45");
+// camera zoom toward the splats: >1 pulls closer (divides the keyframe distance).
+// ?zoom= overrides for quick tuning; the storyboard keyframes stay as authored.
+const ZOOM = parseFloat(P.get("zoom") ?? "1.3");
+// how large the source photos are in the "big" (zoomed-in) phase; ?imgbig= tunes it.
+const IMGBIG = parseFloat(P.get("imgbig") ?? "1.0");
+// world gap between scenes (clouds are ~2 units across); smaller = the previous
+// scene stays visible in the background. ?spacing= tunes it live.
+const SPACING = parseFloat(P.get("spacing") ?? "2.6");
+// per-scene render ceiling: draw at most the top 300k (importance-sorted) splats
+// even if a splat holds up to ~1M. ?maxsplats= raises it (e.g. for a hi-detail render).
+const VIEW_CAP = parseInt(P.get("maxsplats") ?? "300000", 10);
+// reveal curve exponent: >1 eases in (reveal the big front-loaded splats slowly,
+// rush the fine tail) so the visible build-up is even instead of fast-then-stalling.
+const BUILD_CURVE = parseFloat(P.get("buildcurve") ?? "3");
+
+// ---------- math ----------
+function mat4Mul(a,b){ const o=new Float32Array(16); for(let i=0;i<4;i++)for(let j=0;j<4;j++){let s=0;for(let k=0;k<4;k++)s+=a[k*4+j]*b[i*4+k];o[i*4+j]=s;} return o; }
+function perspective(fovy, aspect, n, f){ const t=1/Math.tan(fovy/2); return new Float32Array([t/aspect,0,0,0, 0,t,0,0, 0,0,(f+n)/(n-f),-1, 0,0,(2*f*n)/(n-f),0]); }
+const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]], dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
+const norm=(a)=>{const l=Math.hypot(...a)||1;return [a[0]/l,a[1]/l,a[2]/l];};
+function lookAt(eye, c){ const z=norm(sub(eye,c)), x=norm(cross([0,1,0],z)), y=cross(z,x);
+  return new Float32Array([x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0, -dot(x,eye),-dot(y,eye),-dot(z,eye),1]); }
+
+// ---------- clouds ----------
+const clouds = [];   // one per station, index-aligned with manifest.stations
+function makeCloud(buf, offset){
+  const n = Math.floor(buf.byteLength / 32);
+  const f32 = new Float32Array(buf), u32 = new Uint32Array(buf);
+  let lo=[1e30,1e30,1e30], hi=[-1e30,-1e30,-1e30];
+  for(let i=0;i<n;i++){ for(let k=0;k<3;k++){ const v=f32[i*8+k]; if(v<lo[k])lo[k]=v; if(v>hi[k])hi[k]=v; } }
+  const c=[(lo[0]+hi[0])/2,(lo[1]+hi[1])/2,(lo[2]+hi[2])/2];
+  const diag=Math.hypot(hi[0]-lo[0],hi[1]-lo[1],hi[2]-lo[2]);
+  const scl = 2.0 / Math.max(diag, 1e-6);     // normalize every cloud to ~unit so framing is uniform
+  const positions = new Float32Array(n*3);
+  for(let i=0;i<n;i++){
+    const px=(f32[i*8]-c[0])*scl+offset[0], py=(f32[i*8+1]-c[1])*scl+offset[1], pz=(f32[i*8+2]-c[2])*scl+offset[2];
+    f32[i*8]=px; f32[i*8+1]=py; f32[i*8+2]=pz;
+    f32[i*8+3]*=scl; f32[i*8+4]*=scl; f32[i*8+5]*=scl;
+    positions[i*3]=px; positions[i*3+1]=py; positions[i*3+2]=pz;
+  }
+  const tex=gl.createTexture();
+  const rows=Math.ceil((n*2)/TEX_W);
+  const tbuf=new Uint32Array(TEX_W*rows*4); tbuf.set(u32.subarray(0,n*8));
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32UI,TEX_W,rows,0,gl.RGBA_INTEGER,gl.UNSIGNED_INT,tbuf);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+  return { n, positions, tex, idxBuf: gl.createBuffer(), offset, reveal: 0, sortedCount: 0, key: new Uint16Array(n), order: new Uint32Array(n) };
+}
+// radix depth-sort of the first k (importance-ordered) splats, far-to-near.
+function sortCloud(cloud, view){
+  const k = Math.min(cloud.n, Math.floor(cloud.reveal*cloud.n), VIEW_CAP);
+  cloud.sortedCount = 0;
+  if (k <= 0) return;
+  const pos=cloud.positions, key=cloud.key;
+  let dmin=Infinity,dmax=-Infinity; const d=new Float32Array(k);
+  for(let i=0;i<k;i++){ const z=view[2]*pos[i*3]+view[6]*pos[i*3+1]+view[10]*pos[i*3+2]; d[i]=z; if(z<dmin)dmin=z; if(z>dmax)dmax=z; }
+  const B=65536, cnt=new Uint32Array(B), scale=dmax>dmin?(B-1)/(dmax-dmin):0;
+  for(let i=0;i<k;i++){ let kk=((d[i]-dmin)*scale)|0; kk=kk<0?0:kk>65535?65535:kk; key[i]=kk; cnt[kk]++; }
+  for(let i=1;i<B;i++) cnt[i]+=cnt[i-1];
+  const order=cloud.order;
+  for(let i=k-1;i>=0;i--) order[--cnt[key[i]]]=i;
+  gl.bindBuffer(gl.ARRAY_BUFFER, cloud.idxBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, order.subarray(0,k), gl.DYNAMIC_DRAW);
+  cloud.sortedCount = k;
+}
+
+// ---------- textures (photos + captions) ----------
+function texFromImage(img){
+  const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);   // photos/text only (see note above)
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,img);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  // naturalWidth is undefined for <canvas> (used by textTexture) — fall back to width/height.
+  return { tex:t, ar: (img.naturalWidth||img.width)/(img.naturalHeight||img.height) };
+}
+function loadImage(url){ return new Promise((res,rej)=>{ const im=new Image(); im.crossOrigin="anonymous";
+  im.onload=()=>res(im); im.onerror=()=>rej(new Error("image "+url)); im.src=url; }); }
+function textTexture(text, { font="600 40px ui-sans-serif, system-ui, sans-serif", color="#fff", pad=26, h=70, bg=null }={}){
+  const c=document.createElement("canvas"); let x=c.getContext("2d");
+  x.font=font; const tw=Math.ceil(x.measureText(text).width);
+  c.width=tw+pad*2; c.height=h; x=c.getContext("2d");
+  x.font=font; x.textBaseline="middle";
+  if(bg){ x.fillStyle=bg; const r=14; x.beginPath();
+    x.moveTo(r,0); x.arcTo(c.width,0,c.width,c.height,r); x.arcTo(c.width,c.height,0,c.height,r);
+    x.arcTo(0,c.height,0,0,r); x.arcTo(0,0,c.width,0,r); x.closePath(); x.fill(); }
+  x.fillStyle=color; x.fillText(text,pad,c.height/2+2);
+  return texFromImage(c);
+}
+
+// ---------- storyboard / timeline ----------
+let M = null, fps = 30, stations = [], T = null;
+let keyframes = [], totalDur = 0, totalFrames = 0;
+let wordmark = null, logo = null;
+const pitch = 0.14;
+
+function buildTimeline(){
+  // timeline from the manifest, but every phase is also a live query override
+  // (seconds): ?images_in= ?images_hold= ?images_shrink= ?build= ?settle= ?travel=
+  // ?splat_lag= — plus ?hold= as a friendly alias for how long the photos sit big.
+  T = { ...M.timeline };
+  for (const k of ["travel","images_in","images_hold","images_shrink","build","settle","splat_lag"])
+    if (P.get(k) != null) T[k] = parseFloat(P.get(k));
+  if (P.get("hold") != null) T.images_hold = parseFloat(P.get("hold"));
+  const intro = 0.8;
+  let t = 0; keyframes = [];
+  const centerOf = i => stations[i].offset;
+  keyframes.push({ t:0, target: centerOf(0), dist: 3.4, yaw: -0.5 });
+  for(let i=0;i<stations.length;i++){
+    const travel = (i===0) ? intro : T.travel;
+    const s = stations[i];
+    s.S = t;                                 // segment start (global)
+    s.travel = travel;
+    s.holdEnd = t + travel + T.images_in + T.images_hold;
+    s.shrinkEnd = s.holdEnd + T.images_shrink;
+    s.buildStart = s.holdEnd + T.splat_lag;          // splats start shortly after images move
+    s.buildEnd = s.shrinkEnd + T.build;
+    s.end = s.buildEnd + T.settle;
+    const A = t + travel, D = s.end;
+    keyframes.push({ t:A, target: centerOf(i), dist: 2.8, yaw: -0.3 });   // arrival (pulled back)
+    keyframes.push({ t:D, target: centerOf(i), dist: 2.1, yaw:  0.3 });   // departure (zoomed, orbited)
+    t = D;
+  }
+  totalDur = t; totalFrames = Math.ceil(totalDur*fps);
+}
+function sampleCam(time){
+  let a=keyframes[0], b=keyframes[keyframes.length-1];
+  if(time<=a.t) return a; if(time>=b.t) return b;
+  for(let i=0;i<keyframes.length-1;i++){ if(time>=keyframes[i].t && time<=keyframes[i+1].t){ a=keyframes[i]; b=keyframes[i+1]; break; } }
+  const u=smooth((time-a.t)/Math.max(1e-6,b.t-a.t));
+  return { target: lerp3(a.target,b.target,u), dist: lerp(a.dist,b.dist,u), yaw: lerp(a.yaw,b.yaw,u) };
+}
+function revealOf(s, time){
+  if(time < s.buildStart) return 0;
+  if(time >= s.buildEnd) return 1;
+  const u = (time - s.buildStart)/(s.buildEnd - s.buildStart);
+  return Math.pow(u, BUILD_CURVE);   // ease-in (see BUILD_CURVE note)
+}
+function imageState(s, i, time){
+  // alpha: fade in over images_in once the camera arrives (so images_hold is the
+  // *fully-big* time and ?hold= has a direct effect), then fade out as the next
+  // station arrives. holdEnd = arrival + images_in + images_hold.
+  const fadeIn = smooth((time - (s.S + s.travel)) / Math.max(0.05, T.images_in));
+  const next = stations[i+1];
+  let fadeOut = 1;
+  if(next) fadeOut = 1 - smooth((time - next.S)/(0.8));      // overlaps next travel
+  else     fadeOut = 1 - smooth((time - (totalDur-0.6))/0.6);
+  const alpha = Math.max(0, Math.min(fadeIn, fadeOut));
+  // pp: 0 = big/centered, 1 = small/upper-right
+  const pp = smooth((time - s.holdEnd)/(s.shrinkEnd - s.holdEnd));
+  return { alpha, pp };
+}
+
+// per-image NDC rects for the "big row" (fitted into a box filling most of the
+// frame, so the source photos read even in a thumbnail) and the "corner stack".
+function imageRects(s, aspect){
+  const n = s.imgs.length;
+  const big = [], small = [];
+  const gap = 0.03;
+  // Fit the row of photos into a box ~94% of the frame wide and up to ~82% tall
+  // (×IMGBIG). hH is the common half-height; whichever of width/height binds wins.
+  const capHW = 0.94, capHH = Math.min(0.96, 0.82 * IMGBIG);
+  const sumAR = s.imgs.reduce((a, im) => a + im.ar, 0);
+  const hH = Math.min(capHH, (2*capHW - gap*(n-1)) / (2*sumAR/aspect));
+  const ws = s.imgs.map(im => im.ar*hH/aspect);
+  const totalW = ws.reduce((a, w) => a + 2*w, 0) + gap*(n-1);
+  let x = -totalW/2;
+  for(let i=0;i<n;i++){ const w=ws[i]; big.push({ cx: x+w, cy: 0.05, hw: w, hh: hH }); x += 2*w+gap; }
+  // small: vertical stack, upper-right
+  let sh=0.13, sgap=0.025; let totH = n*2*sh + (n-1)*sgap;
+  if(totH > 1.5){ const k=1.5/totH; sh*=k; }
+  let y = 0.86 - sh;
+  for(let i=0;i<n;i++){ const w=s.imgs[i].ar*sh/aspect; small.push({ cx: 0.96 - w, cy: y, hw: w, hh: sh }); y -= 2*sh+sgap; }
+  return { big, small };
+}
+
+function drawQuad(tex, cx, cy, hw, hh, alpha, border){
+  gl.uniform4f(IU.rect, cx, cy, hw, hh);
+  gl.uniform1f(IU.alpha, alpha); gl.uniform1f(IU.border, border?1:0);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+
+// ---------- frame ----------
+function renderFrame(k, W, H){
+  const time = k/fps;
+  const cam = sampleCam(time);
+  const dist = cam.dist / ZOOM;
+  const fwd=[Math.sin(cam.yaw)*Math.cos(pitch), Math.sin(pitch), Math.cos(cam.yaw)*Math.cos(pitch)];
+  const eye=[cam.target[0]+dist*fwd[0], cam.target[1]+dist*fwd[1], cam.target[2]+dist*fwd[2]];
+  const view=lookAt(eye, cam.target);
+  const aspect=W/H, fovy=1.0;
+  const proj=perspective(fovy, aspect, 0.05, 100);
+  const fy=H/(2*Math.tan(fovy/2)), fx=fy;
+
+  gl.viewport(0,0,W,H);
+  gl.clearColor(0.027,0.035,0.047,1); gl.clear(gl.COLOR_BUFFER_BIT);
+
+  // splats: update reveal, sort visible, draw far cloud first
+  for(let i=0;i<clouds.length;i++) clouds[i].reveal = revealOf(stations[i], time);
+  const visible = [];
+  for(let i=0;i<clouds.length;i++){ if(clouds[i].reveal>0){ sortCloud(clouds[i], view); if(clouds[i].sortedCount>0) visible.push(clouds[i]); } }
+  visible.sort((a,b)=>(view[2]*a.offset[0]+view[6]*a.offset[1]+view[10]*a.offset[2]) - (view[2]*b.offset[0]+view[6]*b.offset[1]+view[10]*b.offset[2]));
+  gl.useProgram(splatProg); gl.bindVertexArray(vaoSplat);
+  gl.uniformMatrix4fv(SU.view,false,view); gl.uniformMatrix4fv(SU.proj,false,proj);
+  gl.uniform2f(SU.focal,fx,fy); gl.uniform2f(SU.viewport,W,H); gl.uniform1f(SU.sat,saturation); gl.uniform1i(SU.tex,0);
+  for(const c of visible){
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, c.tex);
+    gl.bindBuffer(gl.ARRAY_BUFFER, c.idxBuf); gl.vertexAttribIPointer(aIndex,1,gl.UNSIGNED_INT,0,0);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, c.sortedCount);
+  }
+
+  // image billboards + captions
+  gl.useProgram(imgProg); gl.bindVertexArray(vaoImg); gl.uniform1i(IU.img,0);
+  let activeLabel = null, activeLabelA = 0;
+  for(let i=0;i<stations.length;i++){
+    const s = stations[i];
+    const st = imageState(s, i, time);
+    if(st.alpha <= 0.001) continue;
+    const { big, small } = imageRects(s, aspect);
+    for(let j=0;j<s.imgs.length;j++){
+      const A=big[j], Bk=small[j];
+      const cx=lerp(A.cx,Bk.cx,st.pp), cy=lerp(A.cy,Bk.cy,st.pp), hw=lerp(A.hw,Bk.hw,st.pp), hh=lerp(A.hh,Bk.hh,st.pp);
+      drawQuad(s.imgs[j].tex, cx, cy, hw, hh, st.alpha, true);
+    }
+    if(st.alpha > activeLabelA){ activeLabelA = st.alpha; activeLabel = s; }
+  }
+  // active caption (bottom-left) follows the strongest station
+  if(activeLabel){
+    const L=activeLabel.labelTex, h=0.07, w=L.ar*h/aspect;
+    drawQuad(L.tex, -0.985+w, -0.90, w, h, activeLabelA, false);
+  }
+  // persistent branding badge: LocalAI logo + project name, top-left (the photo
+  // thumbnails live upper-right, so this corner stays clear).
+  const by = 0.88; let bx = -0.965;
+  if(logo){ const hl=0.075, wl=logo.ar*hl/aspect; drawQuad(logo.tex, bx+wl, by, wl, hl, 0.97, false); bx += 2*wl + 0.02; }
+  if(wordmark){ const ht=0.05, wt=wordmark.ar*ht/aspect; drawQuad(wordmark.tex, bx+wt, by, wt, ht, 0.95, false); }
+
+  gl.bindVertexArray(null);
+}
+
+// ---------- capture ----------
+let capturing = false;
+async function capture(W, H, session){
+  capturing = true; $("play").checked = false; $("ui").style.opacity = 0.25;
+  canvas.width=W; canvas.height=H;
+  // ?from/?to/?step sample a subset (sparse stills or smoke tests); ?frames caps the end.
+  const from = Math.max(0, +(P.get("from") || 0));
+  const cap  = Math.min(totalFrames, +(P.get("frames") || totalFrames));
+  const to   = Math.min(cap, +(P.get("to") || cap));
+  const step = Math.max(1, +(P.get("step") || 1));
+  // wipe any prior frames for this session first, so a re-render can't inherit a
+  // previous run's stale tail (the #1 cause of "I downloaded an old video").
+  if (from === 0) await fetch(`/api/demo/clear?session=${session}`, { method:"POST" });
+  const t0 = performance.now(); let done=0;
+  for(let k=from;k<to;k+=step){
+    renderFrame(k, W, H);
+    const blob = await new Promise(r=>canvas.toBlob(r,"image/png"));
+    const resp = await fetch(`/api/demo/frame?session=${session}&k=${k}`, { method:"POST", body:blob });
+    if(!resp.ok){ setStatus("frame POST failed: "+await resp.text(), true); capturing=false; return; }
+    done++;
+    if(done%5===0) setStatus(`rendering frame ${k} (${done} done) · ${((performance.now()-t0)/1000).toFixed(1)}s`);
+  }
+  if(P.get("encode")==="0" || step>1){ setStatus(`captured ${done} frames (no encode)`); capturing=false; return; }
+  setStatus("encoding with ffmpeg…");
+  const enc = await fetch(`/api/demo/encode?session=${session}&fps=${fps}`, { method:"POST" });
+  if(!enc.ok){ setStatus("encode failed: "+await enc.text(), true); capturing=false; return; }
+  const j = await enc.json();
+  // cache-bust: the URL is otherwise identical every render, so the browser can
+  // hand back a cached older MP4 on download.
+  const link = `${j.video}?v=${Date.now()}`;
+  setStatus(`done · ${(j.bytes/1e6).toFixed(1)} MB · <a class="dl" href="${link}" target="_blank">open / download ▶</a>`);
+  capturing = false;
+}
+
+// ---------- preview ----------
+let previewStart = performance.now();
+function fitPreview(){
+  if(capturing) return;
+  const dpr=Math.min(devicePixelRatio,2);
+  canvas.width=Math.round(innerWidth*dpr); canvas.height=Math.round(innerHeight*dpr);
+}
+addEventListener("resize", fitPreview);
+function loop(){
+  if(!capturing && totalFrames>0){
+    let k;
+    if($("play").checked){ const el=(performance.now()-previewStart)/1000; k=Math.floor((el % totalDur)*fps); $("scrub").value=Math.round(k/totalFrames*1000); }
+    else k=Math.floor(+$("scrub").value/1000*totalFrames);
+    renderFrame(Math.min(k,totalFrames-1), canvas.width, canvas.height);
+  }
+  requestAnimationFrame(loop);
+}
+
+$("scrub").addEventListener("input", ()=>{ $("play").checked=false; });
+$("play").addEventListener("change", ()=>{ if($("play").checked) previewStart=performance.now()-(+$("scrub").value/1000*totalDur)*1000; });
+$("render").addEventListener("click", ()=>{
+  if(capturing) return;
+  const [w,h]=$("res").value.split("x").map(Number);
+  const session = "demo_"+$("res").value;
+  capture(w, h, session).then(fitPreview);
+});
+
+// ---------- init ----------
+(async () => {
+  try {
+    M = await (await fetch("/demo-assets/manifest.json")).json();
+    fps = M.fps || 30;
+    wordmark = textTexture(M.title || "free-splatter.cpp", { font:"600 38px ui-sans-serif, system-ui, sans-serif", color:"#eef3ff", h:60 });
+    // optional branding logo (drop one at <demo-dir>/logo.png); silently skipped if absent.
+    try { logo = texFromImage(await loadImage("/demo-assets/logo.png")); } catch {}
+    // lay scenes out along X at the (live-tunable) spacing, overriding the manifest.
+    stations = M.stations.map((s, i) => ({ ...s, offset: [i * SPACING, 0, 0] }));
+    setStatus(`loading ${stations.length} scenes…`);
+    for(const s of stations){
+      const buf = await (await fetch("/demo-assets/"+s.splat)).arrayBuffer();
+      clouds.push(makeCloud(buf, s.offset));
+      s.imgs = [];
+      for(const rel of s.images){ const im = await loadImage("/demo-assets/"+rel); s.imgs.push(texFromImage(im)); }
+      s.labelTex = textTexture(s.label, { font:"600 38px ui-sans-serif, system-ui, sans-serif", color:"#ffffff", h:64, bg:"rgba(10,12,16,0.72)" });
+    }
+    buildTimeline();
+    $("scrub").max = 1000;
+    $("sub").textContent = `${stations.length} scenes · ${totalDur.toFixed(1)}s · ${totalFrames} frames @ ${fps}fps`;
+    // single-frame mode (?t=<sec> or ?frame=<k>): render one deterministic frame
+    // and stop — used for headless stills and shareable deep-links.
+    if(P.has("t") || P.has("frame")){
+      $("ui").style.display = "none";
+      const w=+(P.get("w")||M.width||1920), h=+(P.get("h")||M.height||1080);
+      canvas.width=w; canvas.height=h;
+      const k = P.has("frame") ? +P.get("frame") : Math.round(parseFloat(P.get("t"))*fps);
+      renderFrame(Math.max(0, Math.min(totalFrames-1, k)), w, h);
+      return;
+    }
+    setStatus("ready — preview is playing; press Render to encode an MP4");
+    fitPreview(); requestAnimationFrame(loop);
+    if(P.get("capture")==="1"){
+      const w=+(P.get("w")||M.width||1920), h=+(P.get("h")||M.height||1080);
+      await capture(w, h, P.get("session")||"demo");
+    }
+  } catch(e){ setStatus("init failed: "+(e.message||e), true); console.error(e); }
+})();
+</script>
+</body>
+</html>
