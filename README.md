@@ -29,7 +29,9 @@ No Nix? You just need CMake, a C++17 compiler, and the bundled `ggml` submodule
 free_splatter-cli --device vulkan --splat scene.splat model.gguf view1.jpg view2.jpg
 ```
 
-- `model.gguf` — the model weights (see Releases).
+- `model.gguf` — the model weights, from
+  [huggingface.co/LocalAI-io/free-splatter.cpp](https://huggingface.co/LocalAI-io/free-splatter.cpp)
+  (e.g. `freesplatter-scene-f16.gguf`).
 - the input views — ordinary image files (JPG/PNG/…); each is center-cropped and
   resized to 512×512. (Or pass one raw `.f32` file: views as 32-bit floats in
   `[0,1]`, view-major channels-then-rows-then-columns.)
