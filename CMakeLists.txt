@@ -31,6 +31,54 @@ endif()
 set(GGML_BUILD_TESTS    OFF)
 set(GGML_BUILD_EXAMPLES OFF)
 
+# tinyBLAS (llamafile) cache-blocked GEMM for the CPU backend. ggml ships it OFF
+# by default, leaving mul_mat on the per-row ggml_vec_dot fallback; turning it on
+# gives a cache-blocked F16/F32 GEMM that runs the transformer Linears ~1.6x
+# faster (53%->32% of CPU time at S=8192). It is numerically a no-op (same f32
+# accumulation) and is parity-verified layer-by-layer against the f64 reference
+# at the strict CPU-f32 gate. Set as the ggml *default* (not forced) so it covers
+# every preset yet still yields to an explicit -DGGML_LLAMAFILE=OFF.
+set(GGML_LLAMAFILE_DEFAULT ON)
+
+# Portable, fast CPU build by DEFAULT -- including a preset-less `cmake -B build`.
+# Build every ggml CPU ISA variant (SSE..AVX-512) as runtime-dispatched dynamic
+# backends and pick the best at load time, instead of a single -march=native
+# target. Native is fragile across machines and, under Nix, NIX_ENFORCE_NO_NATIVE
+# strips it -- silently leaving a ~13x slower SCALAR build. The presets used to be
+# the only portable path; this makes the bare build "just work" too.
+#
+# Scope: only a plain CPU Release/RelWithDebInfo (or the typeless bare build).
+# Skipped for GPU/fuzz/debug builds (kept simple and quick to compile), and each
+# knob is guarded so an explicit -D or a preset cacheVariable still wins:
+#   - release-native (GGML_NATIVE=ON) keeps its single native target -- the
+#     `AND NOT GGML_NATIVE` guards avoid ggml's NATIVE-vs-BACKEND_DL conflict;
+#   - release / release-portable already set these ON (DEFINED -> left as-is).
+# (GGML_BACKEND_DL's BUILD_SHARED_LIBS requirement is met by ggml's own
+# default-ON shared-libs option on Linux.)
+if ((NOT CMAKE_BUILD_TYPE OR CMAKE_BUILD_TYPE MATCHES "Release|RelWithDebInfo")
+        AND NOT FREE_SPLATTER_VULKAN AND NOT FREE_SPLATTER_CUDA AND NOT FREE_SPLATTER_FUZZ)
+    # CACHE (no FORCE): visible/overridable, and an explicit -D or preset value
+    # already in the cache wins. ggml's own option() then honors these.
+    set(GGML_NATIVE OFF CACHE BOOL "ggml: optimize for the build CPU (off => portable multi-variant build)")
+    if (NOT GGML_NATIVE)
+        set(GGML_BACKEND_DL       ON CACHE BOOL "ggml: build backends as dynamic libs (enables runtime CPU ISA dispatch)")
+        set(GGML_CPU_ALL_VARIANTS ON CACHE BOOL "ggml: build every CPU ISA variant; best is picked at load time")
+    endif()
+endif()
+
+# Co-locate our executables with ggml's dynamically-loaded backend .so files. A
+# GGML_BACKEND_DL build emits libggml-*.so to <build>/bin and loads them by path
+# at runtime; ggml sets CMAKE_RUNTIME_OUTPUT_DIRECTORY for that, but only in its
+# own (subdirectory) scope -- so without this our cli/bench land in the build
+# root, away from the backends, and startup fails with "CPU backend init failed".
+# The presets set this explicitly; an explicit value still wins (if-not-set).
+# Gated on GGML_BACKEND_DL: only a dynamic-backend build needs the co-location,
+# so static builds (vulkan/debug/native presets) keep their default binary
+# location and existing script paths (e.g. bench.sh's build/vulkan/...) hold.
+if (GGML_BACKEND_DL AND NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+endif()
+
 # --- Optional custom-op patch slot (LocalVQE pattern) -----------------------
 # If pieces 1-3 ever need a ggml op not upstream, drop a patch in patches/ and it
 # is applied to the submodule working tree at configure time, idempotently.

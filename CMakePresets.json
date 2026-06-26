@@ -15,19 +15,29 @@
     {
       "name": "release",
       "binaryDir": "${sourceDir}/build/release",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
-    },
-    {
-      "name": "release-portable",
-      "binaryDir": "${sourceDir}/build/release-portable",
-      "description": "Portable + fast CPU: build every ggml-cpu ISA variant and pick the best at runtime. Avoids -march=native (fragile, and stripped by Nix's NIX_ENFORCE_NO_NATIVE).",
+      "description": "Default release build. Portable + fast CPU: builds every ggml-cpu ISA variant (SSE..AVX-512) and selects the best at runtime. We deliberately do NOT default to -march=native: it is fragile across machines, and Nix's NIX_ENFORCE_NO_NATIVE strips it, leaving a SCALAR build ~13x slower. For a single-target native binary on non-Nix, use `release-native`.",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "GGML_NATIVE": "OFF",
         "GGML_BACKEND_DL": "ON",
         "GGML_CPU_ALL_VARIANTS": "ON",
+        "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "${sourceDir}/build/release/bin"
+      }
+    },
+    {
+      "name": "release-portable",
+      "inherits": "release",
+      "binaryDir": "${sourceDir}/build/release-portable",
+      "description": "Alias of `release` (the portable default), kept for scripts/muscle-memory; identical flags in a separate build dir.",
+      "cacheVariables": {
         "CMAKE_RUNTIME_OUTPUT_DIRECTORY": "${sourceDir}/build/release-portable/bin"
       }
+    },
+    {
+      "name": "release-native",
+      "binaryDir": "${sourceDir}/build/release-native",
+      "description": "Single-target -march=native build (one self-contained binary, no runtime ISA dispatch). Fastest on the build machine, but NOT portable, and scalar under Nix (native is stripped) -- use only off-Nix.",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "GGML_NATIVE": "ON" }
     },
     {
       "name": "vulkan",
@@ -58,6 +68,7 @@
     { "name": "debug",            "configurePreset": "debug" },
     { "name": "release",          "configurePreset": "release" },
     { "name": "release-portable", "configurePreset": "release-portable" },
+    { "name": "release-native",   "configurePreset": "release-native" },
     { "name": "vulkan",           "configurePreset": "vulkan" },
     { "name": "profile",          "configurePreset": "profile" },
     { "name": "fuzz",             "configurePreset": "fuzz" }

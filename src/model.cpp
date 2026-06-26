@@ -3,9 +3,30 @@
 #include <ggml.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
+#include <vector>
+
+// Parallel-for over [0,n): splits into contiguous chunks, one per hardware
+// thread, and joins. body(begin,end) must own disjoint output ranges (the
+// post-processing loops below write one output row per index -> race-free).
+template <class F>
+static void parallel_for(int64_t n, F && body) {
+    if (n <= 0) return;
+    unsigned nt = std::max(1u, std::thread::hardware_concurrency());
+    nt = (unsigned) std::min<int64_t>(nt, n);
+    if (nt <= 1) { body(int64_t{0}, n); return; }
+    const int64_t chunk = (n + nt - 1) / nt;
+    std::vector<std::thread> ths;
+    ths.reserve(nt);
+    for (int64_t a = 0; a < n; a += chunk)
+        ths.emplace_back([&body, a, b = std::min(n, a + chunk)] { body(a, b); });
+    for (auto & t : ths) t.join();
+}
 
 namespace free_splatter {
 
@@ -138,6 +159,17 @@ bool model::forward(const float * images, int32_t n_views,
     const float   scale  = 1.0f / std::sqrt((float) dh);   // 1/8
     const float   eps    = h.ln_eps;
 
+    // Optional host-phase timing (FREE_SPLATTER_PROFILE=1) to stderr.
+    const bool prof = std::getenv("FREE_SPLATTER_PROFILE") != nullptr;
+    auto t_clk = std::chrono::steady_clock::now();
+    auto lap = [&](const char * name) {
+        if (!prof) return;
+        const auto now = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "[profile] %-12s %7.2f ms\n", name,
+                     std::chrono::duration<double, std::milli>(now - t_clk).count());
+        t_clk = now;
+    };
+
     const size_t graph_nodes = 8192;
     ggml_init_params gp = {
         ggml_tensor_overhead() * graph_nodes + ggml_graph_overhead_custom(graph_nodes, false),
@@ -202,9 +234,22 @@ bool model::forward(const float * images, int32_t n_views,
         ggml_tensor * q3 = ggml_reshape_3d(ctx, q, dh, nh, S);
         ggml_tensor * k3 = ggml_reshape_3d(ctx, k, dh, nh, S);
         ggml_tensor * v3 = ggml_reshape_3d(ctx, v, dh, nh, S);
-        ggml_tensor * qp = ggml_permute(ctx, q3, 0, 2, 1, 3);          // [dh, S, nh]
+        ggml_tensor * qp = ggml_permute(ctx, q3, 0, 2, 1, 3);          // [dh, S, nh] (f32 query, required by FA)
         ggml_tensor * kp = ggml_permute(ctx, k3, 0, 2, 1, 3);
-        ggml_tensor * vp = ggml_cont(ctx, ggml_permute(ctx, v3, 0, 2, 1, 3));
+        ggml_tensor * vp = ggml_permute(ctx, v3, 0, 2, 1, 3);
+        // On GPU, cast K/V to f16 so the Vulkan coopmat2 (tensor-core) flash-attn
+        // path is selected — the f32 K/V the projections produce falls off it
+        // (~4x slower FA). softmax still accumulates in f32 (GGML_PREC_F32 below):
+        // this is f16 *inputs*, not an f16 softmax. CPU has no tensor cores and
+        // its tiled FA handles f32 fine, so CPU keeps f32 K/V — leaving the
+        // CPU-f32 strict gate and the CPU-f16 head check byte-for-byte unchanged;
+        // only the (already --scale-widened) GPU path moves.
+        if (!be.is_cpu() && l.wk->type == GGML_TYPE_F16) {
+            kp = ggml_cast(ctx, kp, GGML_TYPE_F16);
+            vp = ggml_cast(ctx, vp, GGML_TYPE_F16);
+        } else {
+            vp = ggml_cont(ctx, vp);   // FA requires V contiguous
+        }
         ggml_tensor * fa = ggml_flash_attn_ext(ctx, qp, kp, vp, nullptr, scale, 0.0f, 0.0f);
         ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
         ggml_tensor * attn = ggml_reshape_2d(ctx, fa, nh * dh, S);     // [D, S]
@@ -234,20 +279,25 @@ bool model::forward(const float * images, int32_t n_views,
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, graph_nodes, false);
     ggml_build_forward_expand(gf, logits);
     for (ggml_tensor * t : tap_list) ggml_build_forward_expand(gf, t);
+    lap("graph_build");
 
     if (!ggml_gallocr_alloc_graph(be.galloc, gf)) {
         error = "graph alloc failed"; ggml_free(ctx); return false;
     }
+    lap("alloc");
 
     ggml_backend_tensor_set(img, images, 0, (size_t) N * C * IMG * IMG * sizeof(float));
+    lap("upload");
 
     if (ggml_backend_graph_compute(be.be, gf) != GGML_STATUS_SUCCESS) {
         error = "graph compute failed"; ggml_free(ctx); return false;
     }
+    lap("compute");
 
     // Read head logits [U,S] (memory j + U*s) and unshuffle on the host.
     std::vector<float> hl((size_t) U * S);
     ggml_backend_tensor_get(logits, hl.data(), 0, hl.size() * sizeof(float));
+    lap("readback");
 
     // out: render-ready gaussians, row-major [N*IMG*IMG, Gc], row =
     // ((n*IMG + hh)*IMG + ww). gaussians_raw is the same but pre-activation.
@@ -257,36 +307,43 @@ bool model::forward(const float * images, int32_t n_views,
         return images[(((n * C) + ch) * IMG + hh) * IMG + ww];
     };
     const float C0 = 0.28209479177387814f;
-    for (int64_t s = 0; s < S; s++) {
-        const int64_t n = s / TPV, t = s % TPV, hp = t / G, wp = t % G;
-        for (int64_t j = 0; j < U; j++) {
-            const int64_t p = j / (P * Gc), q = (j / Gc) % P, c = j % Gc;
-            const int64_t hh = hp * P + p, ww = wp * P + q;
-            float val = hl[(size_t) j + (size_t) U * s];
-            if (h.sh_residual && c >= 3 && c < 6) {   // RGB2SH into SH-DC term
-                val += (img_at(n, c - 3, hh, ww) - 0.5f) / C0;
+    parallel_for(S, [&](int64_t s0, int64_t s1) {
+        for (int64_t s = s0; s < s1; s++) {
+            const int64_t n = s / TPV, t = s % TPV, hp = t / G, wp = t % G;
+            for (int64_t j = 0; j < U; j++) {
+                const int64_t p = j / (P * Gc), q = (j / Gc) % P, c = j % Gc;
+                const int64_t hh = hp * P + p, ww = wp * P + q;
+                float val = hl[(size_t) j + (size_t) U * s];
+                if (h.sh_residual && c >= 3 && c < 6) {   // RGB2SH into SH-DC term
+                    val += (img_at(n, c - 3, hh, ww) - 0.5f) / C0;
+                }
+                raw[(size_t) ((n * IMG + hh) * IMG + ww) * Gc + c] = val;
             }
-            raw[(size_t) ((n * IMG + hh) * IMG + ww) * Gc + c] = val;
         }
-    }
+    });
+    lap("unshuffle");
 
-    // gaussians_raw tap (pre-activation), then activations -> gaussians.
+    // gaussians_raw tap (pre-activation), emitted before we mutate `raw`; then
+    // activate in place and move into `out` (no 48 MB copy).
     if (sink) sink("gaussians_raw", raw.data(), PIX, Gc);
-    out = raw;
     const float smin = h.scale_min_act, smax = h.scale_max_act;
     auto sigmoid = [](float v) { return 1.0f / (1.0f + std::exp(-v)); };
-    for (int64_t r = 0; r < PIX; r++) {
-        float * g = out.data() + (size_t) r * Gc;
-        // xyz (0:3) and SH (3:15) pass through; opacity sigmoid; scale mapped
-        // sigmoid; rotation (19:23) L2-normalized (quat order w,x,y,z).
-        g[15] = sigmoid(g[15]);
-        for (int c = 16; c < 19; c++) g[c] = smin + (smax - smin) * sigmoid(g[c]);
-        float nrm = 0.0f;
-        for (int c = 19; c < 23; c++) nrm += g[c] * g[c];
-        nrm = std::sqrt(nrm) + 1e-12f;
-        for (int c = 19; c < 23; c++) g[c] /= nrm;
-    }
-    if (sink) sink("gaussians", out.data(), PIX, Gc);
+    parallel_for(PIX, [&](int64_t r0, int64_t r1) {
+        for (int64_t r = r0; r < r1; r++) {
+            float * g = raw.data() + (size_t) r * Gc;
+            // xyz (0:3) and SH (3:15) pass through; opacity sigmoid; scale mapped
+            // sigmoid; rotation (19:23) L2-normalized (quat order w,x,y,z).
+            g[15] = sigmoid(g[15]);
+            for (int c = 16; c < 19; c++) g[c] = smin + (smax - smin) * sigmoid(g[c]);
+            float nrm = 0.0f;
+            for (int c = 19; c < 23; c++) nrm += g[c] * g[c];
+            nrm = std::sqrt(nrm) + 1e-12f;
+            for (int c = 19; c < 23; c++) g[c] /= nrm;
+        }
+    });
+    lap("activation");
+    if (sink) sink("gaussians", raw.data(), PIX, Gc);
+    out = std::move(raw);
 
     // Stream graph taps to the sink one at a time (read into a reused temp, emit,
     // free) so host memory never holds all activations at once.
