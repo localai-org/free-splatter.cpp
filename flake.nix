@@ -11,7 +11,10 @@
       # hf_dump.py) run in docker/Dockerfile.cuda alongside the GPU model. The
       # M0 gate synthesizes its test GGUF in C++ (tests/test_loader.cpp), so the
       # build + fast test tier need no Python at all.
-      pyEnv = pkgs.python3.withPackages (ps: with ps; [ numpy ]);
+      # opencv4 (cv2): the downstream pose/ prototype mirrors FreeSplatter's
+      # cv2.solvePnPRansac for the exact-upstream PnP path; numpy-only fallback
+      # otherwise. Not needed by the engine build/test.
+      pyEnv = pkgs.python3.withPackages (ps: with ps; [ numpy opencv4 ]);
     in
     {
       devShells.${system} = {
