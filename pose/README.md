@@ -97,6 +97,16 @@ anywhere numpy is.
   ATE **11%** of extent with drift growing 7%→13% (monotone monocular scale drift,
   0.755 over 12 links); the 2.6M-point cloud renders as a **coherent room** matching
   the input. The accumulating-reconstruction idea is **proven** end-to-end.
+- `find_loop.py` — search re10k poses for a clip that revisits its start (the loop
+  substrate). `loop_closure.py` — chain open-loop, measure the loop error via a
+  closing pair, then distribute it (even Sim(3) relaxation, `align.sim_frac_power`)
+  and report ATE before/after. **Finding:** loop closure helps only when drift
+  *accumulates* into a large loop error. On the real loop clip tested it did NOT
+  help — the open-loop chain already closes (loop error 4.4° / scale 1.12 / 8%
+  trans), so the ~34% ATE is per-link **odometry noise** (inlier% as low as 17%
+  on fast legs) + the focal-bias warp, *self-consistent but distorted vs GT*, which
+  loop closure can't fix. The correction machinery itself is verified to recover
+  synthetic accumulated drift to ~0 (`test_pose.py::test_loop_correction`).
 
 ## Run the tests
 
@@ -127,13 +137,18 @@ FS_DEVICE=cpu nix develop -c python3 \
 - ✅ **Accumulation prototype** — sliding-window Sim(3) chaining over a clip builds
   one coherent world; trajectory tracks GT to ~11% ATE with bounded-able drift. The
   idea is proven; per CLAUDE.md the next implementation step is the **C++ port**.
+- ✅ **Loop closure** — implemented + machinery verified on synthetic drift (recovers
+  to ~0). On a real loop clip it did NOT help: the chain already closes, so the error
+  is odometry noise + focal warp, not accumulated drift. Lesson: better odometry
+  (smaller baselines / fusion / focal) is the lever for short loops; loop closure
+  pays off on long trajectories with consistent accumulated drift.
 
 ## Not done yet (honest)
 
-- **Loop closure / Sim(3) pose-graph** to bound the monotone scale + pose drift
-  (the prototype chains open-loop; a forward pan never revisits).
-- **Consensus fusion** to remove the residual ~2% floaters during accumulation.
-- A **higher-motion clip** for the wide-baseline sweet-spot sweep (the sample clip
-  is a slow pan, max ~6° over 160 frames).
+- **Better odometry** is the bigger lever than loop closure for short clips:
+  smaller per-pair baselines, **consensus fusion** (remove the ~2% floaters /
+  lift the low-inlier links), and the **focal bias** (recovered ~274 vs GT ~440+).
+- A **higher-motion clip** wide-baseline sweep, and a **long** trajectory where
+  loop closure demonstrably pays off.
 - The **C++ port** (CLI + C API, no Python) once the design is locked — then this
   prototype is deleted.

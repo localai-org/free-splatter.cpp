@@ -195,6 +195,26 @@ def identity():
     return (1.0, np.eye(3), np.zeros(3))
 
 
+# --- Sim(3) as 4x4 matrices (for pose-graph relaxation) --------------------
+
+def sim_matrix(s, R, t):
+    """Sim(3) as a 4x4 homogeneous matrix [[sR, t],[0,1]] (compose == matmul)."""
+    M = np.eye(4)
+    M[:3, :3] = s * R
+    M[:3, 3] = t
+    return M
+
+
+def sim_frac_power(M, f):
+    """Fractional power M^f of a Sim(3) 4x4, via eigendecomposition (real part).
+
+    The even loop-closure relaxation: distribute an accumulated drift D over n
+    nodes by applying D^(k/n) at node k. M^0=I, M^1=M, (M^0.5)^2=M; valid while the
+    rotation is < 180deg (principal branch). Tested in test_pose.py."""
+    w, V = np.linalg.eig(M)
+    return (V @ np.diag(w ** f) @ np.linalg.inv(V)).real
+
+
 def loop_closure_error(transforms):
     """Compose a closed loop of similarities and measure deviation from identity.
 
