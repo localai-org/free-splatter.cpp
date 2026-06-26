@@ -115,6 +115,29 @@ def test_outlier_robustness():
           f"{(~inl[out_idx]).mean()*100:.0f}% of outliers rejected")
 
 
+def test_loop_correction():
+    """Sim(3) even-distribution loop closure recovers a loop from uniform drift."""
+    print("test_loop_correction")
+    R = rand_rotation(RNG)
+    M = align.sim_matrix(1.07, R, np.array([0.3, -0.2, 0.1]))
+    check("M^0 == I", np.allclose(align.sim_frac_power(M, 0.0), np.eye(4), atol=1e-9))
+    check("M^1 == M", np.allclose(align.sim_frac_power(M, 1.0), M, atol=1e-9))
+    check("(M^.5)^2 == M",
+          np.allclose(align.sim_frac_power(M, .5) @ align.sim_frac_power(M, .5), M, atol=1e-9))
+    # distributing a known accumulated drift D^(k/n) cancels it to ~0
+    n = 12
+    D = align.sim_matrix(1.15, R, np.array([0.4, -0.2, 0.1]))
+    clean = np.array([[np.cos(t), np.sin(t), 0.1 * t]
+                      for t in np.linspace(0, 2 * np.pi, n + 1)])
+    drift = np.array([(align.sim_frac_power(np.linalg.inv(D), k / n) @
+                       np.append(clean[k], 1))[:3] for k in range(n + 1)])
+    corr = np.array([(align.sim_frac_power(D, k / n) @
+                      np.append(drift[k], 1))[:3] for k in range(n + 1)])
+    check("drift present before", align._rms(drift - clean) > 0.1)
+    check("recovers clean loop", align._rms(corr - clean) < 1e-9,
+          f"ATE {align._rms(corr - clean):.1e}")
+
+
 def test_loop_closure():
     """A closed loop of consistent links ~= identity; injected scale drift shows."""
     print("test_loop_closure")
@@ -219,7 +242,7 @@ def test_pnp_outliers():
 def main():
     tests = [
         test_similarity_roundtrip, test_scale_detection, test_nonlinear_detection,
-        test_outlier_robustness, test_loop_closure,
+        test_outlier_robustness, test_loop_correction, test_loop_closure,
         test_focal_recovery, test_pnp_recovery, test_pnp_outliers,
     ]
     for t in tests:
