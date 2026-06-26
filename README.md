@@ -12,6 +12,23 @@ network on your CPU (or a Vulkan GPU).
 You give it N images; it gives you, for every pixel, a 3D Gaussian (position,
 colour, opacity, size, orientation) that a Gaussian-splatting viewer can render.
 
+## Speed
+
+One scene — 2 photos at 512×512 — on a desktop (AMD Ryzen 9 7900, NVIDIA
+RTX 5070 Ti), median time for a single forward pass:
+
+| run on | free-splatter.cpp | reference PyTorch¹ |
+|---|--:|--:|
+| **GPU** | **0.22 s** · Vulkan, f16 | 1.37 s · CUDA, fp16 |
+| **CPU** | **14 s** · 12 threads, f16 | 54 s · fp32 |
+
+¹ the upstream FreeSplatter transformer in eager PyTorch — the same forward pass on
+the same machine (reproduce with `scripts/bench.sh`).
+
+A GPU turns a handful of photos into a splat in well under a second; even the
+no-GPU, no-Python CPU path beats the reference by ~4×. Run time scales with the
+number of input views.
+
 ## Build
 
 ```sh
@@ -19,6 +36,12 @@ nix develop            # gets cmake, a compiler, and (optionally) Vulkan
 cmake --preset release
 cmake --build --preset release
 ```
+
+The `release` preset builds a **portable** CPU binary — every ggml CPU ISA
+variant (up to AVX-512), with the best picked at runtime. (It avoids
+`-march=native`, which Nix strips, leaving a ~13× slower scalar build; off-Nix
+you can use `--preset release-native` for a single-target binary.) The
+executables land in `build/release/bin/`.
 
 No Nix? You just need CMake, a C++17 compiler, and the bundled `ggml` submodule
 (`git submodule update --init`).
