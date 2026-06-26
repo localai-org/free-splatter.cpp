@@ -2,18 +2,42 @@
 
 ## What this project is
 
-A GGML/C++ inference engine for the **neural-network front half** of
-TencentARC/FreeSplatter: image patch tokenizer → multi-view self-attention
-transformer → per-pixel 3D-Gaussian parameter head. Given N uncalibrated views
-it returns, per input pixel, the activated Gaussian parameters.
+A GGML/C++ engine for the **neural-network front half** of
+TencentARC/FreeSplatter (image patch tokenizer → multi-view self-attention
+transformer → per-pixel 3D-Gaussian parameter head) **plus the downstream
+camera-pose recovery and cross-run registration that consume its output**. Given
+N uncalibrated views it returns, per input pixel, the activated Gaussian
+parameters; **PnP** then recovers each view's camera, and successive runs are
+aligned into one accumulating world — the path toward live reconstruction from a
+moving camera.
 
-**Scope:** pieces 1–3 only. The **rasterizer and the PnP pose solver are OUT OF
-SCOPE** — they are a downstream consumer of the `[N, H, W, gaussian_channels]`
-tensor this engine produces. Do not add them here.
+**Scope (updated):** the engine (pieces 1–3), **PnP pose recovery (now IN
+scope)**, and the cross-run Sim(3) alignment / accumulation. Keep the seam at the
+`[N, H, W, gaussian_channels]` tensor clean — it is the contract between the
+engine and the pose consumer. Rendering itself stays in the demo viewer
+(Vulkan/WebGL), not the engine.
 
 Target checkpoint first: **`freesplatter-scene`** (`gaussian_channels=23`,
 `sh_residual=true`, black background). The transformer backbone is identical
 across all three variants, so object/object-2dgs are cheap follow-ons.
+
+## Language & dependency policy
+
+- **Everything ships in C++** (the engine, PnP, and the alignment/accumulation
+  once proven). **Go only for the demo web server** — the purego layer that drives
+  the C API → Vulkan + WebGL viewer.
+- **The CLI and the C API must have NO Python dependency at runtime.** Every piece
+  of current and future functionality is reachable from `free_splatter-cli` and
+  `include/free_splatter.h` without invoking Python.
+- **Python is confined to two places, neither shipped:**
+  1. **Dev-time reference / conversion / validation** that runs in
+     `docker/Dockerfile.cuda` (`scripts/hf_dump.py`, `convert.py`,
+     `compare_taps.py`, …) — the only place torch runs; never a runtime dependency.
+  2. **The `pose/` research prototype, TEMPORARILY.** It may continue in Python
+     (numpy + cv2) **only until the accumulating-reconstruction approach is
+     proven**. Once proven it is **rewritten in C++**, exposed via the CLI + C API,
+     and **the Python is deleted.** `pose/` is not wired into CMake/ctest and is a
+     throwaway prototype, not a parallel implementation to maintain.
 
 ## Validation is the backbone (non-negotiable)
 
@@ -47,11 +71,15 @@ This is a numerical port. Correctness means matching the PyTorch reference
 
 ## Per-component discipline
 
-Each component (`image`, `gguf_loader`, `backend`, `model`, the head) has its own
-unit test and is made independently green **before** cross-component parity.
-Component boundaries match the file layout. Keep the seam at the
-`[N,H,W,gaussian_channels]` tensor clean — that is the contract with any
-rasterizer.
+Each component (`image`, `gguf_loader`, `backend`, `model`, the head, and — once
+ported to C++ — **`pose` = PnP + focal + Sim(3) alignment**) has its own unit test
+and is made independently green **before** cross-component parity. Component
+boundaries match the file layout. Keep the seam at the
+`[N,H,W,gaussian_channels]` tensor clean — that is the contract between the engine
+and the pose/rendering consumers. The C++ `pose` component inherits the parity
+discipline the Python prototype already established: **bit-exact to upstream
+`estimate_poses`** (see `pose/check_upstream_parity.py`) and **validated against
+independent ground-truth poses** (`pose/re10k_experiment.py`).
 
 ## Debugging philosophy (mandatory sequence)
 

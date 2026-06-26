@@ -1,12 +1,16 @@
 # pose/ — camera recovery + cross-run alignment (downstream prototype)
 
-**Status: research prototype, deliberately OUTSIDE the validated engine.**
+**Status: TEMPORARY Python prototype — to be rewritten in C++ once proven, then
+deleted.**
 
-The free-splatter.cpp engine is pieces 1–3 only; CLAUDE.md keeps the PnP pose
-solver out of `src/` on purpose. This directory is the *downstream consumer* of
-the engine's `[N, H, W, 23]` output — a self-contained, pure-Python prototype,
-**not wired into the CMake build or `ctest`**. It exists to prototype live,
-accumulating reconstruction from a moving-camera feed.
+PnP pose recovery and cross-run alignment are now **in scope** (see CLAUDE.md).
+The shipped implementation will be **C++**, reachable from `free_splatter-cli` and
+the C API with **no Python dependency**. This directory is the throwaway research
+prototype that proves the accumulating-reconstruction approach first: a
+self-contained numpy + cv2 consumer of the engine's `[N, H, W, 23]` output,
+**not wired into the CMake build or `ctest`**. Once the approach is proven it is
+ported to C++ and this Python is removed — it is not a parallel implementation to
+maintain.
 
 ## Why it's needed
 
