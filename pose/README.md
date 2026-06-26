@@ -82,6 +82,21 @@ anywhere numpy is.
   loader (parser + GT geometry), yt-dlp/ffmpeg frame fetch, and the engine vs
   GT-pose check. **In distribution → the control works**: relative pose recovered
   to **0.4–1.5°** vs GT, opacity confident on 68–75% of pixels.
+- `re10k_crossrun.py` — cross-run consistency vs baseline (the accumulation
+  question): a shared frame's two reconstructions agree on **98% of pixels within
+  10%** of scene extent at small baseline.
+
+### Accumulation prototype (the live idea, assembled)
+
+- `accumulate.py` — slide a window over a clip, recover each pair (PnP), chain a
+  Sim(3) between consecutive runs via their shared-frame correspondences
+  (`align.compose`), drop every frame's gaussians into one world, and measure the
+  recovered camera trajectory vs GT. `render_ply.py` — pinhole projection of the
+  colored cloud to a PNG (visual coherence check).
+- **Result (13 pairs, stride 20):** per-link Sim(3) residual ~1.0–1.4%; trajectory
+  ATE **11%** of extent with drift growing 7%→13% (monotone monocular scale drift,
+  0.755 over 12 links); the 2.6M-point cloud renders as a **coherent room** matching
+  the input. The accumulating-reconstruction idea is **proven** end-to-end.
 
 ## Run the tests
 
@@ -109,12 +124,16 @@ FS_DEVICE=cpu nix develop -c python3 \
   in-distribution re10k (relative pose to 0.4–1.5°); T&T confirmed OOD. Finding:
   the model has a constant wide-FOV focal bias (recovers ~274 vs GT ~439) — benign
   for relative accumulation, off for metric scale.
+- ✅ **Accumulation prototype** — sliding-window Sim(3) chaining over a clip builds
+  one coherent world; trajectory tracks GT to ~11% ATE with bounded-able drift. The
+  idea is proven; per CLAUDE.md the next implementation step is the **C++ port**.
 
 ## Not done yet (honest)
 
-- **Cross-run consistency / accumulation test** on in-distribution data (the live
-  question: clean accumulation vs needing consensus fusion).
+- **Loop closure / Sim(3) pose-graph** to bound the monotone scale + pose drift
+  (the prototype chains open-loop; a forward pan never revisits).
+- **Consensus fusion** to remove the residual ~2% floaters during accumulation.
 - A **higher-motion clip** for the wide-baseline sweet-spot sweep (the sample clip
   is a slow pan, max ~6° over 160 frames).
-- The live pipeline itself (sliding window, sim3 pose-graph to bound drift) and
-  consensus fusion (the floater-removal step) — separate, later.
+- The **C++ port** (CLI + C API, no Python) once the design is locked — then this
+  prototype is deleted.
