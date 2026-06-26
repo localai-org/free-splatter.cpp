@@ -68,6 +68,17 @@ anywhere numpy is.
   REAL engine output (needs cv2 + a dumped `[N,H,W,23]` `.f32`).
 - `empirical.py` — cross-run residual-ladder on real engine output (the scale test).
 
+### Dense GT-posed control (is it us, or the data/model?)
+
+- `tt_control.py` / `tt_experiment.py` — Tanks-and-Temples (NSVF) loader + engine
+  vs GT-pose check. **Verdict: T&T is OUT OF DISTRIBUTION** for FreeSplatter-scene
+  (narrow-FOV object orbits): opacity confident on only 8–17% of pixels, pose error
+  28–145°. Kept as the harness + the negative result.
+- `re10k_control.py` / `re10k_fetch.py` / `re10k_experiment.py` — RealEstate10K
+  loader (parser + GT geometry), yt-dlp/ffmpeg frame fetch, and the engine vs
+  GT-pose check. **In distribution → the control works**: relative pose recovered
+  to **0.4–1.5°** vs GT, opacity confident on 68–75% of pixels.
+
 ## Run the tests
 
 ```sh
@@ -75,6 +86,10 @@ nix develop -c python3 pose/test_pose.py                      # golden, numpy on
 nix develop -c python3 pose/check_cv2_parity.py               # solver vs cv2 (needs cv2)
 EMP_DIR=/path/to/dumps nix develop -c python3 \
     pose/check_upstream_parity.py A_scn.f32                   # orchestration vs upstream
+# dense control (needs the engine + a GGUF + network for re10k frames):
+nix develop -c python3 pose/re10k_fetch.py CLIP.txt OUTDIR 10
+FS_DEVICE=cpu nix develop -c python3 \
+    pose/re10k_experiment.py CLIP.txt OUTDIR 40 20,40,80,160
 ```
 
 ## Status
@@ -86,10 +101,16 @@ EMP_DIR=/path/to/dumps nix develop -c python3 \
   inlier-boundary effect of ≤0.5° on near-degenerate object data, 0° on scene).
 - ✅ **Empirical scale test** — cross-run mismatch is a uniform-scale similarity
   (scene ~11% scale drift), no nonlinear warp; `diagnose` classifies it.
+- ✅ **Dense GT-posed control** — pipeline validated against INDEPENDENT GT on
+  in-distribution re10k (relative pose to 0.4–1.5°); T&T confirmed OOD. Finding:
+  the model has a constant wide-FOV focal bias (recovers ~274 vs GT ~439) — benign
+  for relative accumulation, off for metric scale.
 
 ## Not done yet (honest)
 
-- A **dense/known-good control** sequence (other system or GT poses) before
-  trusting the live path — the baseline-sweet-spot experiment.
+- **Cross-run consistency / accumulation test** on in-distribution data (the live
+  question: clean accumulation vs needing consensus fusion).
+- A **higher-motion clip** for the wide-baseline sweet-spot sweep (the sample clip
+  is a slow pan, max ~6° over 160 frames).
 - The live pipeline itself (sliding window, sim3 pose-graph to bound drift) and
   consensus fusion (the floater-removal step) — separate, later.
