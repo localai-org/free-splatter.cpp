@@ -906,7 +906,7 @@ void Accumulator::add_view(const float * pts, const float * op, const float * rg
         Vec3 w = sim_apply(T, x);
         AccumPoint p;
         p.x = (float) w[0]; p.y = (float) w[1]; p.z = (float) w[2];
-        p.r = rgb[3*i]; p.g = rgb[3*i+1]; p.b = rgb[3*i+2];
+        p.r = rgb[3*i]; p.g = rgb[3*i+1]; p.b = rgb[3*i+2]; p.opacity = op[i];
         p.sx = (float) (T.s * scl[3*i]); p.sy = (float) (T.s * scl[3*i+1]); p.sz = (float) (T.s * scl[3*i+2]);
         std::array<double,4> ql = quat_normalize({ rot[4*i], rot[4*i+1], rot[4*i+2], rot[4*i+3] });
         std::array<double,4> qw = quat_normalize(quat_mul(qT, ql));
@@ -1041,7 +1041,7 @@ FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_fra
     const double v = voxel_frac * ext;
     if (!(v > 0)) return st;
 
-    struct Vox { double sx=0,sy=0,sz=0,sr=0,sg=0,sb=0; double ssx=0,ssy=0,ssz=0; int64_t cnt=0;
+    struct Vox { double sx=0,sy=0,sz=0,sr=0,sg=0,sb=0,sop=0; double ssx=0,ssy=0,ssz=0; int64_t cnt=0;
                  float q[4]={1,0,0,0}; bool has_q=false; std::vector<int32_t> frames; };
     struct Key { int32_t i,j,k; bool operator==(const Key&o) const { return i==o.i&&j==o.j&&k==o.k; } };
     struct KeyHash { size_t operator()(const Key&q) const {
@@ -1063,7 +1063,7 @@ FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_fra
         if (!finite(p)) continue;
         Key key{ vcoord(p.x, lo[0]), vcoord(p.y, lo[1]), vcoord(p.z, lo[2]) };
         Vox & vx = grid[key];
-        vx.sx+=p.x; vx.sy+=p.y; vx.sz+=p.z; vx.sr+=p.r; vx.sg+=p.g; vx.sb+=p.b; vx.cnt++;
+        vx.sx+=p.x; vx.sy+=p.y; vx.sz+=p.z; vx.sr+=p.r; vx.sg+=p.g; vx.sb+=p.b; vx.sop+=p.opacity; vx.cnt++;
         vx.ssx+=p.sx; vx.ssy+=p.sy; vx.ssz+=p.sz;
         if (!vx.has_q) { vx.q[0]=p.qw; vx.q[1]=p.qx; vx.q[2]=p.qy; vx.q[3]=p.qz; vx.has_q=true; } // representative orientation
         bool seen = false;
@@ -1080,6 +1080,7 @@ FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_fra
         AccumPoint p;
         p.x = (float) (vx.sx / vx.cnt); p.y = (float) (vx.sy / vx.cnt); p.z = (float) (vx.sz / vx.cnt);
         p.r = (float) (vx.sr / vx.cnt); p.g = (float) (vx.sg / vx.cnt); p.b = (float) (vx.sb / vx.cnt);
+        p.opacity = (float) (vx.sop / vx.cnt);
         p.sx = (float) (vx.ssx / vx.cnt); p.sy = (float) (vx.ssy / vx.cnt); p.sz = (float) (vx.ssz / vx.cnt);
         p.qw = vx.q[0]; p.qx = vx.q[1]; p.qy = vx.q[2]; p.qz = vx.q[3];
         p.frame = (int32_t) vx.frames.size();   // support count (informational)

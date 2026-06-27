@@ -527,15 +527,15 @@ static void test_consensus_fuse() {
     std::vector<AccumPoint> cloud;
     // 5 surface points, each corroborated by frames {0,1,2} (tight cluster -> one
     // voxel, support 3); 20 isolated single-frame floaters far apart (support 1).
-    // AccumPoint: {xyz, rgb, scale[3], quat(w,x,y,z), frame}; scale/quat are
-    // unused by fusion's counts here, set to a unit gaussian / identity rotation.
+    // AccumPoint: {xyz, rgb, opacity, scale[3], quat(w,x,y,z), frame}; opacity/
+    // scale/quat are unused by fusion's counts here, set to a unit opaque gaussian.
     for (int loc = 0; loc < 5; loc++)
         for (int fr = 0; fr < 3; fr++)
             cloud.push_back({ (float)(2.0*loc) + 0.001f*fr, 0.0f, 0.0f, 0.5f, 0.5f, 0.5f,
-                              1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, fr });
+                              1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, fr });
     for (int j = 0; j < 20; j++)
         cloud.push_back({ 40.0f + 2.0f*j, 0.0f, 0.0f, 0.2f, 0.2f, 0.2f,
-                          1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, j % 4 });
+                          1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, j % 4 });
 
     std::vector<AccumPoint> fused;
     FuseStats st = consensus_fuse(cloud, /*voxel_frac=*/0.02, /*k=*/2, fused);

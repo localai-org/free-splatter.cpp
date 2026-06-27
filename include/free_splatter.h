@@ -99,7 +99,7 @@ FREE_SPLATTER_API int free_splatter_estimate_poses(
 // it came from (for consensus fusion).
 typedef struct {
     float x, y, z;
-    float r, g, b;
+    float r, g, b, opacity;
     float sx, sy, sz;
     float qw, qx, qy, qz;
     int32_t frame;

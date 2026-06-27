@@ -117,7 +117,7 @@ PoseResult estimate_poses(const std::vector<const float *> & points,
 // Sim(3), so the cloud renders as oriented splats, not isotropic points. rgb [0,1].
 struct AccumPoint {
     float x, y, z;
-    float r, g, b;
+    float r, g, b, opacity;  // color [0,1] and activated opacity [0,1] (the splat alpha)
     float sx, sy, sz;        // anisotropic gaussian scale (global frame)
     float qw, qx, qy, qz;    // gaussian rotation quaternion (w,x,y,z), global frame
     int32_t frame;
