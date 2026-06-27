@@ -77,6 +77,62 @@ FREE_SPLATTER_API int  free_splatter_run(free_splatter_ctx * ctx, const float * 
                        int32_t height, int32_t width, float ** out, size_t * n_out);
 FREE_SPLATTER_API void free_splatter_buf_free(void * buf);  // NULL-safe
 
+// ---- downstream pose recovery + accumulation ----
+// The pose consumer of the engine seam: given the engine's [N,H,W,gaussian_channels]
+// output it recovers each view's camera (PnP) and stitches successive runs into one
+// accumulating world (cross-run Sim(3)). Dependency-free (no Python, no OpenCV).
+
+// Recover each view's camera from an engine output buffer. gaussians:
+// n_views*height*width*gaussian_channels float32 (the layout free_splatter_run
+// returns). cam2world_out: caller-owned n_views*16 float32, filled with a
+// row-major 4x4 cam2world per view. If focal_out is non-NULL it receives the
+// estimated shared focal. opacity_threshold gates valid pixels (engine output is
+// already activated). Returns 0 on success, -1 on failure.
+FREE_SPLATTER_API int free_splatter_estimate_poses(
+    const float * gaussians, int32_t n_views, int32_t height, int32_t width,
+    int32_t gaussian_channels, float opacity_threshold,
+    float * cam2world_out, float * focal_out);
+
+// One accumulated point in the global frame: position, color in [0,1], and the
+// source frame it came from (for consensus fusion).
+typedef struct {
+    float x, y, z;
+    float r, g, b;
+    int32_t frame;
+} free_splatter_point;
+
+// Sliding-window accumulator: feed each consecutive pair's engine output and it
+// chains the runs into one world. Opaque handle, not thread-safe.
+typedef struct free_splatter_accumulator free_splatter_accumulator;
+FREE_SPLATTER_API free_splatter_accumulator * free_splatter_accumulator_new(
+    int32_t height, int32_t width, float opacity_threshold);
+FREE_SPLATTER_API void free_splatter_accumulator_free(free_splatter_accumulator * acc); // NULL-safe
+
+// Add one pair's engine output: 2*height*width*gaussian_channels float32, where
+// view 0 shares a frame with the previous pair's view 1. Returns 0 on success.
+FREE_SPLATTER_API int free_splatter_accumulator_add_pair(
+    free_splatter_accumulator * acc, const float * gaussians, int32_t gaussian_channels);
+
+// Number of frames accumulated so far (== pairs_added + 1, or 0 before any pair).
+FREE_SPLATTER_API int free_splatter_accumulator_frame_count(const free_splatter_accumulator * acc);
+
+// Copy the current accumulated cloud: *out is malloc'd free_splatter_point[*n_out]
+// (free with free_splatter_buf_free). Returns 0 on success, -1 on failure.
+FREE_SPLATTER_API int free_splatter_accumulator_cloud(
+    const free_splatter_accumulator * acc, free_splatter_point ** out, size_t * n_out);
+
+// Consensus-fuse the current cloud: keep only voxels (size voxel_frac * extent)
+// corroborated by >= k distinct source frames, averaging the agreeing predictions.
+// *out malloc'd as above. Returns 0 on success, -1 on failure.
+FREE_SPLATTER_API int free_splatter_accumulator_fuse(
+    const free_splatter_accumulator * acc, float voxel_frac, int32_t k,
+    free_splatter_point ** out, size_t * n_out);
+
+// Copy the global camera trajectory: *out malloc'd (*n_frames)*16 float32, a
+// row-major 4x4 cam2world (similarity) per frame. Returns 0 on success.
+FREE_SPLATTER_API int free_splatter_accumulator_camera_path(
+    const free_splatter_accumulator * acc, float ** out, int32_t * n_frames);
+
 #ifdef __cplusplus
 }
 #endif
