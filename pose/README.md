@@ -12,6 +12,31 @@ self-contained numpy + cv2 consumer of the engine's `[N, H, W, 23]` output,
 ported to C++ and this Python is removed — it is not a parallel implementation to
 maintain.
 
+## C++ port status (the ship target — `src/pose.{h,cpp}`)
+
+The port has begun, dependency-free (only the self-contained `src/linalg.h`
+Jacobi eigensolver — no Eigen/OpenCV), wired into the library and the asset-free
+test tier (`tests/test_pose.cpp`, `ctest -LE model`):
+
+- ✅ **`focal.py` → `estimate_focal`** — Weiszfeld; **bit-exact** to the numpy
+  reference on a real scene dump (596.408591886 both).
+- ✅ **`align.py` → Umeyama / RANSAC / residual-ladder / Sim(3) chaining /
+  `sim_frac_power`** — `sim_frac_power` is a closed-form Sim(3) one-parameter
+  subgroup (`A^f=s^f R^f`, translation `(A^f−I)(A−I)⁻¹t`), no complex eig needed.
+  All 9 golden tests (the mirror of `test_pose.py`) pass under ASan/UBSan.
+- ⚠ **`pnp.py` (numpy backend) → `solve_pnp_numpy` + `estimate_poses`** — DLT (via
+  the 12×12 `AᵀA` nullspace, which sidesteps the numpy reference's full-SVD OOM)
+  + RANSAC + cheirality decode. **Correct on clean synthetic data** (golden
+  tests), but on a real scene dump it inherits the **DLT algorithm's planar/mirror
+  degeneracy**: ~3/5 RANSAC seeds land near the cv2/SQPNP answer (58° vs cv2's
+  57° relative rotation), ~2/5 collapse to a ~135–152° flip. This is the *same*
+  instability the numpy reference has — which is exactly why the prototype used
+  **cv2 (SQPNP) for every real-data result**. **Next step:** a robust in-house PnP
+  (EPnP/SQPNP + Gauss-Newton refine) to reach cv2-parity on real scenes with no
+  OpenCV dependency.
+- ⬜ Not yet ported: accumulation chaining, loop closure, consensus fusion (these
+  compose the primitives above), and the CLI / C-API surface.
+
 ## Why it's needed
 
 Each `free_splatter_run` over a different photo pair produces gaussians in its

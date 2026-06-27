@@ -13,6 +13,7 @@ endfunction()
 free_splatter_add_test(test_loader)        # GGUF KV/hparams round-trip
 free_splatter_add_test(test_graph_blocks)  # golden-op pins (ggml ops we depend on)
 free_splatter_add_test(test_image)         # untrusted image-input validation
+free_splatter_add_test(test_pose)          # pose math golden tests (focal/align/PnP)
 
 # Per-layer parity vs the float64 PyTorch reference. Labelled "model": runs only
 # under `ctest -L model` and self-skips (77) unless FREE_SPLATTER_GGUF and
