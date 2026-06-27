@@ -183,10 +183,13 @@ struct FuseStats {
     int64_t raw_points, voxels, kept_voxels, points_kept, points_dropped;
 };
 // Voxelize the cloud at voxel_frac * cloud-extent and keep only voxels corroborated
-// by >= k DISTINCT source frames, averaging the agreeing predictions (which also
-// denoises the surface). `fused` receives one averaged point per consensus voxel.
+// by >= k DISTINCT source frames (single-frame floaters dropped). With keep_raw =
+// false this DENOISES: `fused` gets one averaged gaussian per consensus voxel (clean
+// but decimated — sparse when few voxels are multiply-observed). With keep_raw =
+// true it keeps DENSITY: `fused` gets every raw gaussian whose voxel is corroborated
+// (floaters removed, nothing averaged away) — the better choice for few frames.
 FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_frac, int k,
-                         std::vector<AccumPoint> & fused);
+                         std::vector<AccumPoint> & fused, bool keep_raw = false);
 
 // ---- loop closure (mirrors loop_closure.py) -------------------------------
 // Inverse of a similarity 4x4 [[sR,t],[0,1]] (sR = s*rotation): [[(1/s)Rᵀ,...],[0,1]].
