@@ -55,6 +55,14 @@
   #strip .thumb.new .tag { background: rgba(91,140,255,.92); color: #fff; }
   #hint { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); z-index: 10;
     color: #6b7280; font-size: 11.5px; background: rgba(16,19,24,.7); padding: 6px 12px; border-radius: 8px; }
+  /* prominent banner shown only on a labelled (consensus-fused) step */
+  #banner { position: fixed; top: 18px; left: 50%; transform: translateX(-50%) translateY(-12px); z-index: 11;
+    display: none; opacity: 0; transition: opacity .4s ease, transform .4s ease;
+    padding: 9px 18px; border-radius: 999px; font-size: 13.5px; font-weight: 600; letter-spacing: .2px;
+    color: #eafff0; background: linear-gradient(90deg, rgba(34,160,90,.95), rgba(46,120,210,.95));
+    border: 1px solid rgba(255,255,255,.25); box-shadow: 0 8px 26px rgba(0,0,0,.5); }
+  #banner.show { display: block; opacity: 1; transform: translateX(-50%) translateY(0); }
+  #banner b { font-weight: 750; }
 </style>
 </head>
 <body>
@@ -70,6 +78,7 @@
   <div id="ctl"><button id="prev">‹ prev</button><button id="play">⏸ pause</button><button id="next">next ›</button></div>
 </div>
 <div id="strip"></div>
+<div id="banner"></div>
 <div id="hint">drag to orbit · scroll to zoom · the cloud grows as each photo is added</div>
 
 <script type="module">
@@ -316,17 +325,23 @@ async function loadStep(i){
   if (!manifest || i<0 || i>=manifest.steps.length) return;
   cur=i; const step=manifest.steps[i];
   $("bar").firstElementChild.style.width = Math.round((i+1)/manifest.steps.length*100)+"%";
-  $("s-frames").textContent = step.n;
+  $("s-frames").textContent = step.label ? "fused (" + step.n + ")" : step.n;
+  const banner = $("banner");
+  banner.classList.toggle("show", !!step.label);     // prominent only on the fused step
   setStatus(`folding view ${step.n} — ${step.splat}`);
   renderStrip(step);
   try {
-    const resp = await fetch(`${BASE}/${step.splat}`);
+    const resp = await fetch(`${BASE}/${step.splat}`, { cache: "no-store" });
     if(!resp.ok) throw new Error("HTTP "+resp.status+" for "+step.splat);
     const bytes = new Uint8Array(await resp.arrayBuffer());
     setSplat(bytes);
     if(!framed) frameToData(1.25);                   // frame once; camera stays as it grows
-    setStatus(step.label ? `${step.label} · ${count.toLocaleString()} splats`
-                         : `${step.n} photos · ${count.toLocaleString()} splats`);
+    if (step.label) {
+      banner.innerHTML = `<b>✓ ${step.label}</b> · ${count.toLocaleString()} splats`;
+      setStatus(`${step.label} · ${count.toLocaleString()} splats`);
+    } else {
+      setStatus(`${step.n} photos · ${count.toLocaleString()} splats`);
+    }
   } catch(err){ setStatus(err.message, true); console.error(err); }
 }
 function schedule(){ clearTimeout(timer); if(!playing) return;
@@ -339,7 +354,7 @@ $("play").onclick = ()=>{ playing=!playing; $("play").textContent = playing?"⏸
   requestAnimationFrame(render);
   try {
     setStatus("loading manifest…");
-    manifest = await (await fetch(`${BASE}/manifest.json`)).json();
+    manifest = await (await fetch(`${BASE}/manifest.json`, { cache: "no-store" })).json();
     if(!manifest.steps || !manifest.steps.length) throw new Error("manifest has no steps");
     const s0 = Math.max(0, Math.min(manifest.steps.length-1, START_STEP));
     await loadStep(s0);
