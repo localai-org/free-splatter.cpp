@@ -61,8 +61,17 @@ test tier (`tests/test_pose.cpp`, `ctest -LE model`):
   EPnP-vs-cv2 PnP backend feeding `D`, since the distribution math itself is
   bit-identical to numpy. Confirms the prototype's finding: on this short clip the
   chain already closes, so loop closure is a near-identity correction.
-- ⬜ Not yet ported: consensus fusion (composes the primitives above), and the
-  CLI / C-API surface.
+- ✅ **Consensus fusion → `consensus_fuse` (fuse.py)** — voxelize the accumulated
+  cloud at `voxel_frac · extent` and keep only voxels corroborated by ≥ K distinct
+  source frames, averaging the agreeing predictions (the per-point `frame` tag the
+  `Accumulator` carries makes this a single hash-grid pass). Golden test pins the
+  counts exactly on controlled synthetic support. **Real-data parity** vs `fuse.py`
+  on the 13 `acc` dumps (voxel 0.02, K≥2): raw points **bit-exact** (2,633,725),
+  per-point floater drop **14.0% vs 14%**, raw→fused reduction 93.9% vs 94%,
+  kept-voxel fraction 53.8% vs 54% — the sub-1% voxel-count delta is the chaining
+  RANSAC-RNG shifting positions at voxel boundaries, not the fusion math. The
+  prototype's "remove the 14% single-frame edge-haze floaters" result reproduces.
+- ⬜ Not yet ported: the CLI / C-API surface (then this prototype is deleted).
 
 ## Why it's needed
 
