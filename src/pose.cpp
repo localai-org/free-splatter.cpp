@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <unordered_map>
 
 namespace free_splatter {
 namespace pose {
@@ -834,6 +835,205 @@ PoseResult estimate_poses(const std::vector<const float *> & points,
         for (auto & c : res.cam2world) for (int i = 0; i < 3; i++) c(i, 3) *= res.scale;
     }
     return res;
+}
+
+// ---- accumulation ---------------------------------------------------------
+
+namespace {
+inline float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+const double SH_C0 = 0.28209479177387814;   // SH degree-0 basis (DC -> rgb)
+} // namespace
+
+Accumulator::Accumulator(int H, int W, double opacity_threshold,
+                         double ransac_thresh_frac, int ransac_iters, uint64_t seed)
+    : H_(H), W_(W), thr_(opacity_threshold), rthr_(ransac_thresh_frac),
+      riters_(ransac_iters), seed_(seed), T_(sim_identity()), final_cam_(mat4_identity()) {}
+
+void Accumulator::add_view(const float * pts, const float * op, const float * rgb,
+                           const Sim3 & T, int frame) {
+    const int P = H_ * W_;
+    for (int i = 0; i < P; i++) {
+        if (op[i] <= thr_) continue;
+        Vec3 x = { pts[3*i], pts[3*i+1], pts[3*i+2] };
+        Vec3 w = sim_apply(T, x);
+        AccumPoint p;
+        p.x = (float) w[0]; p.y = (float) w[1]; p.z = (float) w[2];
+        p.r = rgb[3*i]; p.g = rgb[3*i+1]; p.b = rgb[3*i+2];
+        p.frame = frame;
+        cloud_.push_back(p);
+    }
+}
+
+ChainLink Accumulator::add_pair(const float * g, int gc, double focal) {
+    const int P = H_ * W_;
+    // de-interleave the two views: points (ch 0:3), opacity (ch 15, already
+    // sigmoid-activated), rgb = clip(SH_DC * C0 + 0.5, 0, 1) (ch 3:6).
+    std::vector<float> pts0(3*P), pts1(3*P), op0(P), op1(P), rgb0(3*P), rgb1(3*P);
+    for (int i = 0; i < P; i++) {
+        const float * a0 = g + (size_t) i * gc;
+        const float * a1 = g + (size_t) (P + i) * gc;
+        for (int c = 0; c < 3; c++) { pts0[3*i+c] = a0[c]; pts1[3*i+c] = a1[c]; }
+        op0[i] = a0[15]; op1[i] = a1[15];
+        for (int c = 0; c < 3; c++) {
+            rgb0[3*i+c] = clamp01((float) (a0[3+c] * SH_C0 + 0.5));
+            rgb1[3*i+c] = clamp01((float) (a1[3+c] * SH_C0 + 0.5));
+        }
+    }
+
+    // recover this pair's cameras (view-0 frame, use_first_focal)
+    std::vector<const float *> pts = { pts0.data(), pts1.data() };
+    std::vector<const float *> ops = { op0.data(),  op1.data()  };
+    PoseResult pr = estimate_poses(pts, ops, H_, W_, thr_, focal, 100, false, seed_);
+    const Mat4 c2w0 = pr.cam2world[0], c2w1 = pr.cam2world[1];
+
+    ChainLink link{};
+    if (!have_prev_) {
+        T_ = sim_identity();
+        link.sim = sim_identity();
+        link.global = T_;
+        link.scale = 1.0; link.inlier_frac = 1.0; link.valid_frac = 1.0; link.resid_frac = 0.0;
+        add_view(pts0.data(), op0.data(), rgb0.data(), T_, next_frame_++);   // f_0
+        add_view(pts1.data(), op1.data(), rgb1.data(), T_, next_frame_++);   // f_1
+    } else {
+        // fit Sim(3) from this run's view 0 (the shared frame, run-k coords) to the
+        // previous run's view 1 (same frame, run-(k-1) coords). Mask = valid in both.
+        std::vector<double> XA, XB;
+        for (int i = 0; i < P; i++) if (op0[i] > thr_ && prev_mask1_[i]) {
+            XA.push_back(pts0[3*i]); XA.push_back(pts0[3*i+1]); XA.push_back(pts0[3*i+2]);
+            XB.push_back(prev_pts1_[3*i]); XB.push_back(prev_pts1_[3*i+1]); XB.push_back(prev_pts1_[3*i+2]);
+        }
+        const int n = (int) (XA.size() / 3);
+        double myB[3]; mean3(XB.data(), n, myB);
+        std::vector<double> ycB(3*n);
+        for (int i = 0; i < n; i++) for (int c = 0; c < 3; c++) ycB[3*i+c] = XB[3*i+c] - myB[c];
+        const double scene = rms3(ycB.data(), n);
+
+        std::vector<char> inl;
+        Sim3 S = fit_similarity_ransac(XA.data(), XB.data(), n, rthr_ * scene, riters_, inl, true, seed_);
+        T_ = sim_compose(T_, S);                 // run k -> global
+
+        int n_inl = 0;
+        std::vector<double> rA, rB;
+        for (int i = 0; i < n; i++) if (inl[i]) {
+            n_inl++;
+            Vec3 a = { XA[3*i], XA[3*i+1], XA[3*i+2] };
+            Vec3 sa = sim_apply(S, a);
+            for (int c = 0; c < 3; c++) { rA.push_back(sa[c] - XB[3*i+c]); }
+            (void) rB;
+        }
+        link.sim = S;
+        link.global = T_;
+        link.scale = S.s;
+        link.inlier_frac = (n > 0) ? (double) n_inl / n : 0.0;
+        link.valid_frac  = (double) n / P;
+        link.resid_frac  = (scene > 0 && n_inl > 0) ? rms3(rA.data(), n_inl) / scene : 0.0;
+
+        add_view(pts1.data(), op1.data(), rgb1.data(), T_, next_frame_++);   // f_{k+1}
+    }
+
+    cams_.push_back(mat4_mul(sim_matrix(T_), c2w0));     // frame f_k camera (view 0)
+    final_cam_ = mat4_mul(sim_matrix(T_), c2w1);         // latest view-1 camera
+
+    // this run's view 1 becomes the next run's shared frame
+    prev_pts1_.assign(pts1.begin(), pts1.end());
+    prev_mask1_.assign(P, 0);
+    for (int i = 0; i < P; i++) prev_mask1_[i] = (op1[i] > thr_) ? 1 : 0;
+    have_prev_ = true;
+    links_.push_back(link);
+    return link;
+}
+
+std::vector<Mat4> Accumulator::camera_path() const {
+    std::vector<Mat4> path = cams_;
+    if (!cams_.empty()) path.push_back(final_cam_);
+    return path;
+}
+
+// ---- consensus fusion -----------------------------------------------------
+
+FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_frac, int k,
+                         std::vector<AccumPoint> & fused) {
+    fused.clear();
+    FuseStats st{};
+    st.raw_points = (int64_t) cloud.size();
+    if (cloud.empty()) return st;
+
+    // extent = rms distance to centroid; voxel = voxel_frac * extent; coords from min.
+    double mean[3] = {0,0,0}, lo[3] = {1e300,1e300,1e300};
+    for (const auto & p : cloud) {
+        mean[0]+=p.x; mean[1]+=p.y; mean[2]+=p.z;
+        lo[0]=std::min(lo[0],(double)p.x); lo[1]=std::min(lo[1],(double)p.y); lo[2]=std::min(lo[2],(double)p.z);
+    }
+    for (int c = 0; c < 3; c++) mean[c] /= cloud.size();
+    double ss = 0;
+    for (const auto & p : cloud) {
+        const double dx=p.x-mean[0], dy=p.y-mean[1], dz=p.z-mean[2];
+        ss += dx*dx + dy*dy + dz*dz;
+    }
+    const double ext = std::sqrt(ss / cloud.size());
+    const double v = voxel_frac * ext;
+    if (!(v > 0)) return st;
+
+    struct Vox { double sx=0,sy=0,sz=0,sr=0,sg=0,sb=0; int64_t cnt=0; std::vector<int32_t> frames; };
+    struct Key { int32_t i,j,k; bool operator==(const Key&o) const { return i==o.i&&j==o.j&&k==o.k; } };
+    struct KeyHash { size_t operator()(const Key&q) const {
+        uint64_t h = (uint64_t)(uint32_t)q.i * 0x9E3779B97F4A7C15ULL;
+        h ^= (uint64_t)(uint32_t)q.j + 0x9E3779B9U + (h<<6) + (h>>2);
+        h ^= (uint64_t)(uint32_t)q.k + 0x85EBCA6BU + (h<<6) + (h>>2);
+        return (size_t) h; } };
+    std::unordered_map<Key, Vox, KeyHash> grid;
+    grid.reserve(cloud.size() / 2 + 1);
+
+    for (const auto & p : cloud) {
+        Key key{ (int32_t) std::floor((p.x - lo[0]) / v),
+                 (int32_t) std::floor((p.y - lo[1]) / v),
+                 (int32_t) std::floor((p.z - lo[2]) / v) };
+        Vox & vx = grid[key];
+        vx.sx+=p.x; vx.sy+=p.y; vx.sz+=p.z; vx.sr+=p.r; vx.sg+=p.g; vx.sb+=p.b; vx.cnt++;
+        bool seen = false;
+        for (int32_t f : vx.frames) if (f == p.frame) { seen = true; break; }
+        if (!seen) vx.frames.push_back(p.frame);
+    }
+
+    st.voxels = (int64_t) grid.size();
+    for (const auto & kv : grid) {
+        const Vox & vx = kv.second;
+        if ((int) vx.frames.size() < k) continue;
+        st.kept_voxels++;
+        st.points_kept += vx.cnt;
+        AccumPoint p;
+        p.x = (float) (vx.sx / vx.cnt); p.y = (float) (vx.sy / vx.cnt); p.z = (float) (vx.sz / vx.cnt);
+        p.r = (float) (vx.sr / vx.cnt); p.g = (float) (vx.sg / vx.cnt); p.b = (float) (vx.sb / vx.cnt);
+        p.frame = (int32_t) vx.frames.size();   // support count (informational)
+        fused.push_back(p);
+    }
+    st.points_dropped = st.raw_points - st.points_kept;
+    return st;
+}
+
+// ---- loop closure ---------------------------------------------------------
+
+Mat4 sim4_invert(const Mat4 & M) {
+    Mat3 A{}; Vec3 t{};
+    for (int i = 0; i < 3; i++) { for (int j = 0; j < 3; j++) A(i,j) = M(i,j); t[i] = M(i,3); }
+    const double s = std::cbrt(det3(A));
+    Mat3 R = A;
+    for (int i = 0; i < 9; i++) R.a[i] /= s;
+    Sim3 inv = sim_invert(Sim3{ s, R, t });
+    return sim_matrix(inv);
+}
+
+std::vector<Vec3> distribute_drift(const Mat4 & D, const std::vector<Mat4> & global_poses) {
+    const int m = (int) global_poses.size();
+    std::vector<Vec3> out(m);
+    const int n = std::max(m - 1, 1);
+    for (int k = 0; k < m; k++) {
+        Mat4 Dk = sim_frac_power(D, (double) k / n);
+        Vec3 c = { global_poses[k](0,3), global_poses[k](1,3), global_poses[k](2,3) };
+        Vec3 r = mat3_apply(Mat3{ { Dk(0,0),Dk(0,1),Dk(0,2), Dk(1,0),Dk(1,1),Dk(1,2), Dk(2,0),Dk(2,1),Dk(2,2) } }, c);
+        out[k] = { r[0] + Dk(0,3), r[1] + Dk(1,3), r[2] + Dk(2,3) };
+    }
+    return out;
 }
 
 } // namespace pose

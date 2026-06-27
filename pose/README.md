@@ -37,8 +37,19 @@ test tier (`tests/test_pose.cpp`, `ctest -LE model`):
   **cv2-parity on real data with no OpenCV dependency**, versus the numpy DLT's
   175° miss on the same dump. Golden tests cover exact recovery, a near-planar
   config (where DLT flips), and 15% gross-outlier rejection.
-- ⬜ Not yet ported: accumulation chaining, loop closure, consensus fusion (these
-  compose the primitives above), and the CLI / C-API surface.
+- ✅ **Accumulation chaining → `Accumulator` (accumulate.py)** — the live
+  sliding-window loop: feed each consecutive pair's `[2,H,W,gc]` engine output,
+  it recovers the pair's cameras (`estimate_poses`), fits the cross-run Sim(3) on
+  the shared frame, composes a global chain, and drops every new frame's gaussians
+  into one world (`cloud()`, `camera_path()`). Golden-tested (synthetic clip:
+  trajectory ATE 7.6e-8 of extent, per-link scale to 3e-9). **Real-data parity**
+  on the 13 cached `pair_*.f32` dumps vs the numpy/cv2 prototype: cloud size
+  **bit-exact** (2,633,725) and per-link valid% identical (deterministic mask);
+  per-link Sim(3) scale agrees to **mean 0.5%** (11/12 links <1%, worst on the
+  documented low-inlier leg); trajectory within **6.6%** of the cv2 chain — the
+  residual is the known RANSAC-RNG + EPnP-vs-SQPNP delta, not a port gap.
+- ⬜ Not yet ported: loop closure, consensus fusion (these compose the primitives
+  above), and the CLI / C-API surface.
 
 ## Why it's needed
 
