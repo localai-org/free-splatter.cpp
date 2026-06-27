@@ -93,11 +93,15 @@ FREE_SPLATTER_API int free_splatter_estimate_poses(
     int32_t gaussian_channels, float opacity_threshold,
     float * cam2world_out, float * focal_out);
 
-// One accumulated point in the global frame: position, color in [0,1], and the
-// source frame it came from (for consensus fusion).
+// One accumulated 3D gaussian in the global frame: position, color in [0,1], the
+// anisotropic scale and rotation quaternion (w,x,y,z) — transformed through the
+// cross-run Sim(3) so the cloud renders as oriented splats — and the source frame
+// it came from (for consensus fusion).
 typedef struct {
     float x, y, z;
     float r, g, b;
+    float sx, sy, sz;
+    float qw, qx, qy, qz;
     int32_t frame;
 } free_splatter_point;
 

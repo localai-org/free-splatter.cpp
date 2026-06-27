@@ -111,11 +111,15 @@ PoseResult estimate_poses(const std::vector<const float *> & points,
                           bool normalize = false, uint64_t seed = 0);
 
 // ---- accumulation: chain successive runs into one world (mirrors accumulate.py)
-// One accumulated point in the global frame, tagged with the source frame it came
-// from (consensus fusion needs the frame id). rgb is in [0,1].
+// One accumulated 3D gaussian in the global frame, tagged with the source frame
+// it came from (consensus fusion needs the frame id). Carries the full anisotropic
+// shape (scale + rotation quaternion w,x,y,z), transformed through the cross-run
+// Sim(3), so the cloud renders as oriented splats, not isotropic points. rgb [0,1].
 struct AccumPoint {
     float x, y, z;
     float r, g, b;
+    float sx, sy, sz;        // anisotropic gaussian scale (global frame)
+    float qw, qx, qy, qz;    // gaussian rotation quaternion (w,x,y,z), global frame
     int32_t frame;
 };
 
@@ -156,6 +160,7 @@ public:
 
 private:
     void add_view(const float * pts, const float * op, const float * rgb,
+                  const float * scl, const float * rot,    // P*3 scale, P*4 quat (w,x,y,z)
                   const Sim3 & T, int frame);
 
     int H_, W_;
