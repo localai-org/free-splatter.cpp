@@ -107,6 +107,12 @@ anywhere numpy is.
   on fast legs) + the focal-bias warp, *self-consistent but distorted vs GT*, which
   loop closure can't fix. The correction machinery itself is verified to recover
   synthetic accumulated drift to ~0 (`test_pose.py::test_loop_correction`).
+- `fuse.py` — **consensus fusion** (the edge-noise answer): voxelize the accumulated
+  cloud at the consistency scale and keep only voxels corroborated by ≥K distinct
+  frames, averaging the agreeing predictions. On the forward clip: **14% of points
+  are single-frame floaters** that render as incoherent edge-haze, while the ≥2-frame
+  consensus renders as a **clean, crisp room** with the haze gone. Tradeoff: dropping
+  single-frame points also trims the single-view periphery (coverage vs cleanliness).
 
 ## Run the tests
 
@@ -142,13 +148,18 @@ FS_DEVICE=cpu nix develop -c python3 \
   is odometry noise + focal warp, not accumulated drift. Lesson: better odometry
   (smaller baselines / fusion / focal) is the lever for short loops; loop closure
   pays off on long trajectories with consistent accumulated drift.
+- ✅ **Consensus fusion** — gating the accumulated cloud on ≥2-frame agreement removes
+  the 14% single-frame floaters (incoherent edge-haze) and yields a clean surface —
+  the definitive "yes, accumulation removes the edge noise." Trades single-view
+  periphery for a cleaner core.
 
 ## Not done yet (honest)
 
-- **Better odometry** is the bigger lever than loop closure for short clips:
-  smaller per-pair baselines, **consensus fusion** (remove the ~2% floaters /
-  lift the low-inlier links), and the **focal bias** (recovered ~274 vs GT ~440+).
-- A **higher-motion clip** wide-baseline sweep, and a **long** trajectory where
-  loop closure demonstrably pays off.
+- The **focal bias** (recovered ~274 vs GT ~440+) — the remaining geometry-distortion
+  source; worth understanding whether it's fixable.
+- A **higher-motion clip** wide-baseline sweep, and a **long** trajectory where loop
+  closure demonstrably pays off.
+- **Fuse-then-align**: feed the consensus surface back into the odometry (lift the
+  low-inlier links the loop-closure diagnosis flagged), not just the final cloud.
 - The **C++ port** (CLI + C API, no Python) once the design is locked — then this
   prototype is deleted.
