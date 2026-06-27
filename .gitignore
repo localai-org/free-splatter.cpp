@@ -20,6 +20,9 @@ __pycache__/
 # reference code (third-party, fetched on demand — never vendored here).
 .cache/
 
+# Throwaway working dir for ad-hoc harnesses / scratch (never committed).
+/scratchpad/
+
 # Model + data artifacts (generated; never committed)
 *.gguf
 *.safetensors

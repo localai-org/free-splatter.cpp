@@ -122,6 +122,7 @@ add_library(free_splatter ${_fs_libtype}
     src/gguf_loader.cpp
     src/model.cpp
     src/image.cpp
+    src/pose.cpp
     src/free_splatter.cpp
 )
 target_include_directories(free_splatter PUBLIC include)
