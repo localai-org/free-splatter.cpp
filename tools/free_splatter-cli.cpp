@@ -187,35 +187,60 @@ int main(int argc, char ** argv) {
                 geo.image_width, geo.image_height, geo.in_channels, geo.gaussian_channels);
     if (inputs.empty()) { free_splatter_free(ctx); return 0; }
 
-    // ---- accumulate mode: chain consecutive image pairs into one world --------
+    // ---- accumulate mode: chain a photo stream into one world -----------------
+    // Two input forms: a stream of IMAGES (the engine runs on each consecutive
+    // pair), or pre-computed `.f32` pair dumps (each a [2,H,W,gc] engine output —
+    // the engine is skipped, for fast re-bakes / fusion sweeps off cached runs).
     if (accumulate) {
-        if (inputs.size() < 2) { std::fprintf(stderr, "--accumulate needs >=2 images\n"); free_splatter_free(ctx); return 2; }
-        const int sz = geo.image_width;
-        // decode every frame once (CHW per view)
+        const int sz = geo.image_width, gc = geo.gaussian_channels;
+        const bool dump_mode = std::all_of(inputs.begin(), inputs.end(),
+                                           [](const std::string & s){ return ends_with(s, ".f32"); });
+        if (!dump_mode && inputs.size() < 2) {
+            std::fprintf(stderr, "--accumulate needs >=2 images (or N .f32 pair dumps)\n"); free_splatter_free(ctx); return 2; }
+        const size_t npairs = dump_mode ? inputs.size() : inputs.size() - 1;
+        const int64_t per_view = (int64_t) geo.in_channels * sz * sz;
+        const size_t  pair_floats = (size_t) 2 * sz * sz * gc;
+
+        // image mode: decode every frame once (CHW per view)
         std::vector<std::vector<float>> frames;
-        for (const std::string & p : inputs) {
-            std::vector<float> img;
-            if (!load_image_chw(p.c_str(), sz, img)) { free_splatter_free(ctx); return 1; }
-            frames.push_back(std::move(img));
-        }
+        if (!dump_mode)
+            for (const std::string & p : inputs) {
+                std::vector<float> img;
+                if (!load_image_chw(p.c_str(), sz, img)) { free_splatter_free(ctx); return 1; }
+                frames.push_back(std::move(img));
+            }
+
         free_splatter_accumulator * acc = free_splatter_accumulator_new(sz, sz, opac_thr);
         if (!acc) { std::fprintf(stderr, "accumulator alloc failed\n"); free_splatter_free(ctx); return 1; }
 
-        const int64_t per_view = (int64_t) geo.in_channels * sz * sz;
-        for (size_t k = 0; k + 1 < frames.size(); k++) {
-            std::vector<float> pair(2 * per_view);
-            std::memcpy(&pair[0],        frames[k].data(),   per_view * sizeof(float));
-            std::memcpy(&pair[per_view], frames[k+1].data(), per_view * sizeof(float));
-            float * g = nullptr; size_t ng = 0;
-            if (free_splatter_run(ctx, pair.data(), 2, sz, sz, &g, &ng) != 0) {
-                std::fprintf(stderr, "run pair %zu failed: %s\n", k, free_splatter_last_error(ctx));
-                free_splatter_accumulator_free(acc); free_splatter_free(ctx); return 1;
+        for (size_t k = 0; k < npairs; k++) {
+            const float * g = nullptr;
+            std::vector<float> dumpbuf;
+            float * runout = nullptr;
+            if (dump_mode) {
+                std::ifstream f(inputs[k], std::ios::binary | std::ios::ate);
+                if (!f) { std::fprintf(stderr, "cannot open %s\n", inputs[k].c_str()); free_splatter_accumulator_free(acc); free_splatter_free(ctx); return 1; }
+                const std::streamsize bytes = f.tellg(); f.seekg(0);
+                if ((size_t)(bytes / sizeof(float)) != pair_floats) {
+                    std::fprintf(stderr, "dump %s: %zu floats, expected 2*%d*%d*%d\n", inputs[k].c_str(),
+                                 (size_t)(bytes/sizeof(float)), sz, sz, gc);
+                    free_splatter_accumulator_free(acc); free_splatter_free(ctx); return 1; }
+                dumpbuf.resize(pair_floats); f.read((char *) dumpbuf.data(), bytes);
+                g = dumpbuf.data();
+            } else {
+                std::vector<float> pair(2 * per_view);
+                std::memcpy(&pair[0],        frames[k].data(),   per_view * sizeof(float));
+                std::memcpy(&pair[per_view], frames[k+1].data(), per_view * sizeof(float));
+                size_t ng = 0;
+                if (free_splatter_run(ctx, pair.data(), 2, sz, sz, &runout, &ng) != 0) {
+                    std::fprintf(stderr, "run pair %zu failed: %s\n", k, free_splatter_last_error(ctx));
+                    free_splatter_accumulator_free(acc); free_splatter_free(ctx); return 1; }
+                g = runout;
             }
-            free_splatter_accumulator_add_pair(acc, g, geo.gaussian_channels);
-            free_splatter_buf_free(g);
+            free_splatter_accumulator_add_pair(acc, g, gc);
+            if (runout) free_splatter_buf_free(runout);
             const int nframes = free_splatter_accumulator_frame_count(acc);
-            std::printf("pair %zu (%s, %s) -> %d frames\n", k,
-                        inputs[k].c_str(), inputs[k+1].c_str(), nframes);
+            std::printf("pair %zu -> %d frames\n", k, nframes);
             if (splat_prefix) {
                 free_splatter_point * cloud = nullptr; size_t nc = 0;
                 free_splatter_accumulator_cloud(acc, &cloud, &nc);

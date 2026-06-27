@@ -325,7 +325,8 @@ async function loadStep(i){
     const bytes = new Uint8Array(await resp.arrayBuffer());
     setSplat(bytes);
     if(!framed) frameToData(1.25);                   // frame once; camera stays as it grows
-    setStatus(`${step.n} photos · ${count.toLocaleString()} splats`);
+    setStatus(step.label ? `${step.label} · ${count.toLocaleString()} splats`
+                         : `${step.n} photos · ${count.toLocaleString()} splats`);
   } catch(err){ setStatus(err.message, true); console.error(err); }
 }
 function schedule(){ clearTimeout(timer); if(!playing) return;
