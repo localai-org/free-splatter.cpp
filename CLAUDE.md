@@ -33,11 +33,14 @@ across all three variants, so object/object-2dgs are cheap follow-ons.
   1. **Dev-time reference / conversion / validation** that runs in
      `docker/Dockerfile.cuda` (`scripts/hf_dump.py`, `convert.py`,
      `compare_taps.py`, …) — the only place torch runs; never a runtime dependency.
-  2. **The `pose/` research prototype, TEMPORARILY.** It may continue in Python
-     (numpy + cv2) **only until the accumulating-reconstruction approach is
-     proven**. Once proven it is **rewritten in C++**, exposed via the CLI + C API,
-     and **the Python is deleted.** `pose/` is not wired into CMake/ctest and is a
-     throwaway prototype, not a parallel implementation to maintain.
+  2. **The `pose/` research prototype — now DONE and DELETED.** It was the
+     temporary Python (numpy + cv2) prototype that proved the
+     accumulating-reconstruction approach. That approach is proven, the whole
+     pipeline (focal, Sim(3) align, robust PnP, accumulation, loop closure,
+     consensus fusion) is **rewritten in C++** (`src/pose.{h,cpp}`), exposed via
+     `free_splatter-cli` + `include/free_splatter.h`, and the Python prototype has
+     been **removed** (see git history for it and its layer-by-layer parity
+     harnesses). No Python remains in the pose path.
 
 ## Validation is the backbone (non-negotiable)
 
@@ -71,15 +74,16 @@ This is a numerical port. Correctness means matching the PyTorch reference
 
 ## Per-component discipline
 
-Each component (`image`, `gguf_loader`, `backend`, `model`, the head, and — once
-ported to C++ — **`pose` = PnP + focal + Sim(3) alignment**) has its own unit test
-and is made independently green **before** cross-component parity. Component
-boundaries match the file layout. Keep the seam at the
+Each component (`image`, `gguf_loader`, `backend`, `model`, the head, and
+**`pose` = PnP + focal + Sim(3) alignment + accumulation/loop/fusion**) has its own
+unit test and is made independently green **before** cross-component parity.
+Component boundaries match the file layout. Keep the seam at the
 `[N,H,W,gaussian_channels]` tensor clean — that is the contract between the engine
-and the pose/rendering consumers. The C++ `pose` component inherits the parity
-discipline the Python prototype already established: **bit-exact to upstream
-`estimate_poses`** (see `pose/check_upstream_parity.py`) and **validated against
-independent ground-truth poses** (`pose/re10k_experiment.py`).
+and the pose/rendering consumers. The C++ `pose` component (`tests/test_pose.cpp`,
+asset-free golden tier) carries the parity discipline the Python prototype
+established: **bit-exact to upstream `estimate_poses`** and **validated against
+independent ground-truth poses** — see git history for the prototype's
+`check_upstream_parity.py` / `re10k_experiment.py` harnesses.
 
 ## Debugging philosophy (mandatory sequence)
 

@@ -1,9 +1,13 @@
-// pose.cpp — C++ port of the pose/ prototype (focal.py + align.py + pnp.py).
+// pose.cpp — C++ port of the (now removed) pose/ research prototype: focal +
+// Umeyama/Sim(3) align + robust PnP + sliding-window accumulation / loop closure
+// / consensus fusion. See git history for the Python prototype it was validated
+// against, layer by layer.
 //
-// Faithful to FreeSplatter's scene recipe; the dependency-free numpy reference
-// solver is what ships here (verified ~1e-7 vs cv2, bit-exact vs upstream
-// estimate_poses on real engine output). All linear algebra goes through the
-// self-contained Jacobi eigensolver in linalg.h — no Eigen, no OpenCV.
+// Faithful to FreeSplatter's scene recipe; the dependency-free solver is what
+// ships here (the prototype's numpy reference was verified ~1e-7 vs cv2 and
+// bit-exact vs upstream estimate_poses on real engine output). All linear algebra
+// goes through the self-contained Jacobi eigensolver in linalg.h — no Eigen, no
+// OpenCV.
 #include "pose.h"
 
 #include <algorithm>

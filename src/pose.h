@@ -1,14 +1,14 @@
 // pose.h — downstream camera-pose recovery + cross-run alignment (C++ port).
 //
-// This is the C++ port of the proven `pose/` research prototype (focal.py +
-// align.py + pnp.py): given the engine's per-pixel gaussians it recovers each
+// This is the C++ port of the (now removed; see git history) proven `pose/`
+// research prototype: given the engine's per-pixel gaussians it recovers each
 // view's camera (PnP), and aligns successive runs into one accumulating world
 // (Sim(3)). It is dependency-free — only the self-contained linalg.h — so it
 // ships from the CLI / C API with no Python and no Eigen/OpenCV (see CLAUDE.md).
 //
 // Faithful to FreeSplatter's scene recipe (estimate_poses -> DUSt3R fast_pnp):
-// the numpy reference solver, verified ~1e-7 against cv2 and bit-exact to upstream
-// estimate_poses on real engine output (pose/check_upstream_parity.py).
+// the prototype's numpy reference solver was verified ~1e-7 against cv2 and
+// bit-exact to upstream estimate_poses on real engine output.
 //
 // Conventions: f64 throughout; a similarity acts as x -> s*(R@x)+t; gaussian
 // channel layout (scene, 23ch) is xyz[0:3] SH[3:15] opacity[15] scale[16:19]
@@ -71,7 +71,7 @@ LoopError loop_closure_error(const std::vector<Sim3> & links);
 Mat4 sim_frac_power(const Mat4 & M, double f);
 
 // ---- PnP -------------------------------------------------------------------
-// RANSAC DLT PnP with known intrinsics K (mirrors pose/pnp.py numpy backend).
+// RANSAC DLT PnP with known intrinsics K (the prototype's numpy backend).
 // Xw is N*3 world points, pixels is N*2 (col,row). Returns cam2world (4x4) and
 // fills `inliers` (size N, 0/1). Kept as the asset-free golden-test reference; on
 // real scenes the DLT inherits the planar/mirror degeneracy — use solve_pnp.
