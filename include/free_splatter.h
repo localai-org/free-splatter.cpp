@@ -126,18 +126,30 @@ FREE_SPLATTER_API int free_splatter_accumulator_cloud(
     const free_splatter_accumulator * acc, free_splatter_point ** out, size_t * n_out);
 
 // Consensus-fuse the current cloud: keep only voxels (size voxel_frac * extent)
-// corroborated by >= k distinct source frames (single-frame floaters dropped).
-// keep_raw=0 averages each consensus voxel to one point (denoised but decimated);
-// keep_raw=1 keeps every raw gaussian in a consensus voxel (dense, nothing averaged
-// away — better when there are few frames). *out malloc'd as above. Returns 0 ok.
+// corroborated by >= k distinct source frames (single-frame floaters dropped). mode:
+// 0 = averaged (one denoised point per voxel; sparse), 1 = kept (every raw gaussian
+// in a consensus voxel; dense), 2 = best (only the most-confident frame's gaussians
+// per voxel; dense AND de-ghosted). *out malloc'd as above. Returns 0 on success.
 FREE_SPLATTER_API int free_splatter_accumulator_fuse(
-    const free_splatter_accumulator * acc, float voxel_frac, int32_t k, int32_t keep_raw,
+    const free_splatter_accumulator * acc, float voxel_frac, int32_t k, int32_t mode,
     free_splatter_point ** out, size_t * n_out);
 
 // Copy the global camera trajectory: *out malloc'd (*n_frames)*16 float32, a
 // row-major 4x4 cam2world (similarity) per frame. Returns 0 on success.
 FREE_SPLATTER_API int free_splatter_accumulator_camera_path(
     const free_splatter_accumulator * acc, float ** out, int32_t * n_frames);
+
+// Geometric de-ghost a cloud in place (gaussian-level consensus refinement): each
+// iteration non-rigidly pulls every gaussian a fraction `alpha` toward the
+// multi-frame consensus of its (coarse-to-fine voxel_frac) neighbourhood — removing
+// the doubled objects the pairwise pose chain leaves. Returns 0 on success.
+FREE_SPLATTER_API int free_splatter_refine_cloud(
+    free_splatter_point * points, size_t n, float voxel_frac, int32_t iters, float alpha);
+
+// Same, applied to the accumulator's internal cloud (so a subsequent _fuse also
+// operates on the de-ghosted cloud). Returns 0 on success, -1 on bad args.
+FREE_SPLATTER_API int free_splatter_accumulator_refine(
+    free_splatter_accumulator * acc, float voxel_frac, int32_t iters, float alpha);
 
 #ifdef __cplusplus
 }

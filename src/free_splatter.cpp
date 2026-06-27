@@ -254,13 +254,32 @@ int free_splatter_accumulator_cloud(const free_splatter_accumulator * acc,
 }
 
 int free_splatter_accumulator_fuse(const free_splatter_accumulator * acc, float voxel_frac,
-                                   int32_t k, int32_t keep_raw, free_splatter_point ** out, size_t * n_out) {
+                                   int32_t k, int32_t mode, free_splatter_point ** out, size_t * n_out) {
     if (out) *out = nullptr;
     if (n_out) *n_out = 0;
     if (!acc || !out || !n_out || k < 1 || !(voxel_frac > 0)) return -1;
     std::vector<free_splatter::pose::AccumPoint> fused;
-    free_splatter::pose::consensus_fuse(acc->acc.cloud(), voxel_frac, k, fused, keep_raw != 0);
+    free_splatter::pose::consensus_fuse(acc->acc.cloud(), voxel_frac, k, fused, mode);
     return emit_points(fused, out, n_out);
+}
+
+int free_splatter_refine_cloud(free_splatter_point * points, size_t n,
+                               float voxel_frac, int32_t iters, float alpha) {
+    if (!points || n == 0 || !(voxel_frac > 0) || iters < 1) return -1;
+    // free_splatter_point and pose::AccumPoint are the same trivially-copyable layout
+    // (xyz, rgba/opacity, scale, quat, frame); copy into the typed vector and back.
+    std::vector<free_splatter::pose::AccumPoint> cloud(n);
+    std::memcpy(cloud.data(), points, n * sizeof(free_splatter_point));
+    free_splatter::pose::consensus_refine(cloud, voxel_frac, iters, alpha);
+    std::memcpy(points, cloud.data(), n * sizeof(free_splatter_point));
+    return 0;
+}
+
+int free_splatter_accumulator_refine(free_splatter_accumulator * acc, float voxel_frac,
+                                     int32_t iters, float alpha) {
+    if (!acc || !(voxel_frac > 0) || iters < 1) return -1;
+    acc->acc.refine(voxel_frac, iters, alpha);
+    return 0;
 }
 
 int free_splatter_accumulator_camera_path(const free_splatter_accumulator * acc,
