@@ -31,7 +31,10 @@ done
 # 2) accumulate: one engine pass over the stream writes acc_2.splat, acc_3.splat,
 #    ... (the cloud after each photo is folded in) + acc_fused.splat (the
 #    consensus surface: voxels seen by >= K frames, single-view floaters removed).
-"$CLI" --device "$DEVICE" --accumulate --fuse --splat-prefix "$OUT/acc" \
+#    --refine geometrically de-ghosts each step (pulls overlapping frames together);
+#    set REFINE=0 to disable.
+RFLAG=; [ "${REFINE:-1}" = 1 ] && RFLAG=--refine
+"$CLI" --device "$DEVICE" --accumulate $RFLAG --fuse --splat-prefix "$OUT/acc" \
   --max-splats "$MAXSPLATS" "$MODEL" "${FRAMES[@]}"
 
 # 3) manifest.json: one step per added photo (acc_n.splat + the n thumbnails, the
