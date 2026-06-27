@@ -540,16 +540,21 @@ static void test_consensus_fuse() {
                           1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, j % 4 });
 
     std::vector<AccumPoint> fused;
-    FuseStats st = consensus_fuse(cloud, /*voxel_frac=*/0.02, /*k=*/2, fused);
+    FuseStats st = consensus_fuse(cloud, /*voxel_frac=*/0.02, /*k=*/2, fused, FUSE_AVERAGED);
     check("raw points", st.raw_points == 35);
     check("kept voxels (the surface)", st.kept_voxels == 5);
     check("fused size (averaged: one per voxel)", fused.size() == 5);
     check("points kept", st.points_kept == 15);
     check("floaters dropped", st.points_dropped == 20);
-    // keep_raw=true: dense — every raw point in a consensus voxel, floaters dropped
+    // FUSE_KEPT: dense — every raw point in a consensus voxel, floaters dropped
     std::vector<AccumPoint> kept;
-    consensus_fuse(cloud, /*voxel_frac=*/0.02, /*k=*/2, kept, /*keep_raw=*/true);
+    consensus_fuse(cloud, /*voxel_frac=*/0.02, /*k=*/2, kept, FUSE_KEPT);
     check("kept mode: dense (all 15 consensus raw points)", kept.size() == 15);
+    // FUSE_BEST: per voxel only the most-confident frame. Each surface voxel has 3
+    // frames with equal opacity (0.5) so frame 0 (first seen) wins the tie -> 5 points.
+    std::vector<AccumPoint> best;
+    consensus_fuse(cloud, /*voxel_frac=*/0.02, /*k=*/2, best, FUSE_BEST);
+    check("best mode: one frame per voxel (5 points)", best.size() == 5);
     // a fused point sits at its cluster centroid (~2*loc), color preserved
     bool centroid_ok = true;
     for (const auto & p : fused) {
@@ -557,6 +562,55 @@ static void test_consensus_fuse() {
         centroid_ok &= std::fabs(p.x - 2.0*loc) < 0.01 && std::fabs(p.r - 0.5) < 1e-6;
     }
     check("fused centroid + color", centroid_ok);
+}
+
+// Gaussian-level de-ghost: a base scene seen by 3 frames through small per-object
+// misalignments ghosts; consensus_refine (non-rigid, per-point) must pull the
+// overlapping copies together.
+static void test_consensus_refine() {
+    std::printf("test_consensus_refine\n");
+    // well-separated base points (a grid, spacing 1) so each object's 3 copies share
+    // a voxel but distinct objects don't — the real (2D surface) regime.
+    const int side = 4, M = side*side*side, Fr = 3;
+    std::normal_distribution<double> g(0, 1);
+    std::vector<double> base(3*M);
+    { int idx=0; for (int a=0;a<side;a++) for (int b=0;b<side;b++) for (int c=0;c<side;c++) {
+        base[3*idx]=a; base[3*idx+1]=b; base[3*idx+2]=c; idx++; } }
+    auto small_rot = [&](double deg) {
+        Vec3 ax = { g(RNG), g(RNG), g(RNG) };
+        double n = std::sqrt(ax[0]*ax[0]+ax[1]*ax[1]+ax[2]*ax[2]); ax={ax[0]/n,ax[1]/n,ax[2]/n};
+        const double a=deg*M_PI/180, c=std::cos(a), s=std::sin(a), v=1-c, x=ax[0], y=ax[1], z=ax[2];
+        return Mat3{ { c+x*x*v, x*y*v-z*s, x*z*v+y*s,  y*x*v+z*s, c+y*y*v, y*z*v-x*s,  z*x*v-y*s, z*y*v+x*s, c+z*z*v } };
+    };
+    Sim3 P[3] = { sim_identity(),
+                  { 1.0, small_rot(1.0), { 0.04, -0.03, 0.035 } },
+                  { 1.0, small_rot(1.0), { -0.035, 0.04, -0.03 } } };
+    std::vector<AccumPoint> cloud(Fr*M);
+    for (int f = 0; f < Fr; f++) for (int i = 0; i < M; i++) {
+        Vec3 b = { base[3*i], base[3*i+1], base[3*i+2] };
+        Vec3 w = sim_apply(P[f], b);
+        AccumPoint p{}; p.x=(float)w[0]; p.y=(float)w[1]; p.z=(float)w[2];
+        p.opacity=1.0f; p.sx=p.sy=p.sz=0.01f; p.qw=1.0f; p.frame=f;
+        cloud[(size_t)f*M + i] = p;
+    }
+    double mean[3]={0,0,0}; for (auto&p:cloud){ mean[0]+=p.x;mean[1]+=p.y;mean[2]+=p.z; }
+    for (int c=0;c<3;c++) mean[c]/=cloud.size();
+    double ss=0; for (auto&p:cloud){ double dx=p.x-mean[0],dy=p.y-mean[1],dz=p.z-mean[2]; ss+=dx*dx+dy*dy+dz*dz; }
+    const double ext = std::sqrt(ss/cloud.size());
+    auto spread = [&](const std::vector<AccumPoint>& c) {
+        double s=0;
+        for (int i=0;i<M;i++) { double cx=0,cy=0,cz=0;
+            for (int f=0;f<Fr;f++){ cx+=c[(size_t)f*M+i].x; cy+=c[(size_t)f*M+i].y; cz+=c[(size_t)f*M+i].z; }
+            cx/=Fr; cy/=Fr; cz/=Fr;
+            for (int f=0;f<Fr;f++){ const auto&p=c[(size_t)f*M+i]; s += (p.x-cx)*(p.x-cx)+(p.y-cy)*(p.y-cy)+(p.z-cz)*(p.z-cz); } }
+        return std::sqrt(s/(M*Fr))/ext;
+    };
+    const double pre = spread(cloud);
+    consensus_refine(cloud, /*voxel_frac=*/0.1, /*iters=*/12, /*alpha=*/0.6);
+    const double post = spread(cloud);
+    char buf[80]; std::snprintf(buf, sizeof buf, "ghosting %.3f%% -> %.3f%% of extent", 100*pre, 100*post);
+    check("ghosting present before", pre > 0.01);
+    check("consensus_refine de-ghosts", post < 0.4 * pre, buf);
 }
 
 static void test_loop_distribute() {
@@ -680,6 +734,7 @@ int main() {
     test_pnp_robust_outliers();
     test_accumulate_chain();
     test_consensus_fuse();
+    test_consensus_refine();
     test_loop_distribute();
     test_splat_record();
     test_accumulate_channels();

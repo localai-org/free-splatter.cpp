@@ -157,6 +157,8 @@ public:
     int  frame_count() const { return next_frame_; }
     int  pair_count()  const { return (int) links_.size(); }
     const Sim3 & global_transform() const { return T_; }
+    // Geometric de-ghost the accumulated cloud in place (consensus_refine).
+    double refine(double voxel_frac = 0.03, int iters = 8, double alpha = 0.5);
 
 private:
     void add_view(const float * pts, const float * op, const float * rgb,
@@ -183,13 +185,28 @@ struct FuseStats {
     int64_t raw_points, voxels, kept_voxels, points_kept, points_dropped;
 };
 // Voxelize the cloud at voxel_frac * cloud-extent and keep only voxels corroborated
-// by >= k DISTINCT source frames (single-frame floaters dropped). With keep_raw =
-// false this DENOISES: `fused` gets one averaged gaussian per consensus voxel (clean
-// but decimated — sparse when few voxels are multiply-observed). With keep_raw =
-// true it keeps DENSITY: `fused` gets every raw gaussian whose voxel is corroborated
-// (floaters removed, nothing averaged away) — the better choice for few frames.
+// by >= k DISTINCT source frames (single-frame floaters dropped). `mode` selects how
+// a consensus voxel is emitted:
+//   FUSE_AVERAGED (0): one averaged gaussian per voxel — denoised but decimated
+//                      (sparse unless many frames overlap).
+//   FUSE_KEPT (1):     every raw gaussian in the voxel — dense, nothing averaged.
+//   FUSE_BEST (2):     only the single most-confident frame's gaussians per voxel —
+//                      dense AND de-ghosted (no overlapping copies stacked).
+enum FuseMode { FUSE_AVERAGED = 0, FUSE_KEPT = 1, FUSE_BEST = 2 };
 FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_frac, int k,
-                         std::vector<AccumPoint> & fused, bool keep_raw = false);
+                         std::vector<AccumPoint> & fused, int mode = FUSE_AVERAGED);
+
+// ---- gaussian-level geometric de-ghost (multi-view consensus refinement) ----
+// Pairwise Sim(3) chaining leaves per-OBJECT (non-rigid) misregistration that a
+// per-frame pose fit can't remove, so overlapping frames show doubled objects.
+// This refines the cloud IN PLACE at the gaussian level: each iteration, for every
+// point, moves it a fraction `alpha` toward the opacity-weighted consensus of the
+// OTHER frames' points in its (coarse-to-fine) voxel neighbourhood. Non-rigid and
+// local, so spatially-varying ghosting collapses to one surface; single-frame
+// regions (no other frame nearby) are left untouched. Returns the RMS point-to-
+// consensus distance after refinement, as a fraction of cloud extent.
+double consensus_refine(std::vector<AccumPoint> & cloud, double voxel_frac = 0.03,
+                        int iters = 8, double alpha = 0.5);
 
 // ---- loop closure (mirrors loop_closure.py) -------------------------------
 // Inverse of a similarity 4x4 [[sR,t],[0,1]] (sR = s*rotation): [[(1/s)Rᵀ,...],[0,1]].

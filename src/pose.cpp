@@ -999,6 +999,10 @@ ChainLink Accumulator::add_pair(const float * g, int gc, double focal) {
     return link;
 }
 
+double Accumulator::refine(double voxel_frac, int iters, double alpha) {
+    return consensus_refine(cloud_, voxel_frac, iters, alpha);
+}
+
 std::vector<Mat4> Accumulator::camera_path() const {
     std::vector<Mat4> path = cams_;
     if (!cams_.empty()) path.push_back(final_cam_);
@@ -1008,7 +1012,7 @@ std::vector<Mat4> Accumulator::camera_path() const {
 // ---- consensus fusion -----------------------------------------------------
 
 FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_frac, int k,
-                         std::vector<AccumPoint> & fused, bool keep_raw) {
+                         std::vector<AccumPoint> & fused, int mode) {
     fused.clear();
     FuseStats st{};
     st.raw_points = (int64_t) cloud.size();
@@ -1042,7 +1046,12 @@ FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_fra
     if (!(v > 0)) return st;
 
     struct Vox { double sx=0,sy=0,sz=0,sr=0,sg=0,sb=0,sop=0; double ssx=0,ssy=0,ssz=0; int64_t cnt=0;
-                 float q[4]={1,0,0,0}; bool has_q=false; std::vector<int32_t> frames; };
+                 float q[4]={1,0,0,0}; bool has_q=false;
+                 std::vector<std::pair<int32_t,double>> frames;   // (frame, opacity weight)
+                 int best_frame() const {
+                     int32_t b=-1; double bw=-1;
+                     for (auto & fr : frames) if (fr.second > bw) { bw=fr.second; b=fr.first; }
+                     return b; } };
     struct Key { int32_t i,j,k; bool operator==(const Key&o) const { return i==o.i&&j==o.j&&k==o.k; } };
     struct KeyHash { size_t operator()(const Key&q) const {
         uint64_t h = (uint64_t)(uint32_t)q.i * 0x9E3779B97F4A7C15ULL;
@@ -1066,9 +1075,10 @@ FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_fra
         vx.sx+=p.x; vx.sy+=p.y; vx.sz+=p.z; vx.sr+=p.r; vx.sg+=p.g; vx.sb+=p.b; vx.sop+=p.opacity; vx.cnt++;
         vx.ssx+=p.sx; vx.ssy+=p.sy; vx.ssz+=p.sz;
         if (!vx.has_q) { vx.q[0]=p.qw; vx.q[1]=p.qx; vx.q[2]=p.qy; vx.q[3]=p.qz; vx.has_q=true; } // representative orientation
+        const double w = std::max((double) p.opacity, 1e-3);
         bool seen = false;
-        for (int32_t f : vx.frames) if (f == p.frame) { seen = true; break; }
-        if (!seen) vx.frames.push_back(p.frame);
+        for (auto & fr : vx.frames) if (fr.first == p.frame) { fr.second += w; seen = true; break; }
+        if (!seen) vx.frames.push_back({ p.frame, w });
     }
 
     st.voxels = (int64_t) grid.size();
@@ -1079,7 +1089,7 @@ FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_fra
     }
     st.points_dropped = st.raw_points - st.points_kept;
 
-    if (keep_raw) {
+    if (mode == FUSE_KEPT) {
         // DENSE: keep every raw gaussian whose voxel is corroborated by >= k frames
         // (floaters dropped, nothing averaged/decimated away).
         fused.reserve((size_t) st.points_kept);
@@ -1088,6 +1098,17 @@ FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_fra
             Key key{ vcoord(p.x, lo[0]), vcoord(p.y, lo[1]), vcoord(p.z, lo[2]) };
             auto it = grid.find(key);
             if (it != grid.end() && (int) it->second.frames.size() >= k) fused.push_back(p);
+        }
+    } else if (mode == FUSE_BEST) {
+        // DENSE + DE-GHOSTED: in each consensus voxel keep only the single most-
+        // confident frame's gaussians, so overlapping (disagreeing) copies aren't
+        // stacked — one frame represents each region.
+        for (const auto & p : cloud) {
+            if (!finite(p)) continue;
+            Key key{ vcoord(p.x, lo[0]), vcoord(p.y, lo[1]), vcoord(p.z, lo[2]) };
+            auto it = grid.find(key);
+            if (it != grid.end() && (int) it->second.frames.size() >= k && p.frame == it->second.best_frame())
+                fused.push_back(p);
         }
     } else {
         // DENOISED: one averaged gaussian per consensus voxel.
@@ -1105,6 +1126,72 @@ FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_fra
         }
     }
     return st;
+}
+
+// ---- gaussian-level geometric de-ghost -------------------------------------
+
+double consensus_refine(std::vector<AccumPoint> & cloud, double voxel_frac, int iters, double alpha) {
+    if (cloud.size() < 2 || iters < 1) return 0.0;
+    auto finite = [](const AccumPoint & p) {
+        return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z);
+    };
+    struct Key { int32_t i,j,k; bool operator==(const Key&o) const { return i==o.i&&j==o.j&&k==o.k; } };
+    struct KeyHash { size_t operator()(const Key&q) const {
+        uint64_t h = (uint64_t)(uint32_t)q.i * 0x9E3779B97F4A7C15ULL;
+        h ^= (uint64_t)(uint32_t)q.j + 0x9E3779B9U + (h<<6) + (h>>2);
+        h ^= (uint64_t)(uint32_t)q.k + 0x85EBCA6BU + (h<<6) + (h>>2);
+        return (size_t) h; } };
+    struct FC { int32_t f; double sx,sy,sz,w; };   // per-frame opacity-weighted centroid
+
+    double disagree = 0.0;
+    for (int it = 0; it < iters; it++) {
+        double mean[3]={0,0,0}, lo[3]={1e300,1e300,1e300}; int64_t nf=0;
+        for (const auto & p : cloud) { if (!finite(p)) continue;
+            mean[0]+=p.x; mean[1]+=p.y; mean[2]+=p.z;
+            lo[0]=std::min(lo[0],(double)p.x); lo[1]=std::min(lo[1],(double)p.y); lo[2]=std::min(lo[2],(double)p.z); nf++; }
+        if (nf == 0) return disagree;
+        for (int c=0;c<3;c++) mean[c]/=nf;
+        double ss=0; for (const auto & p : cloud) { if (!finite(p)) continue;
+            const double dx=p.x-mean[0], dy=p.y-mean[1], dz=p.z-mean[2]; ss+=dx*dx+dy*dy+dz*dz; }
+        const double ext = std::sqrt(ss / nf);
+        const double frac = (iters > 1)
+            ? voxel_frac * std::pow(2.0, 1.0 - (double) it / (iters - 1))   // 2*vf -> vf (coarse->fine)
+            : voxel_frac;
+        const double v = frac * ext;
+        if (!(v > 0)) return disagree;
+        auto vc = [&](double x, double l) -> int32_t {
+            const double c = std::floor((x - l) / v);
+            if (c < -2.1e9) return -2100000000;
+            if (c >  2.1e9) return  2100000000;
+            return (int32_t) c; };
+
+        // pass 1: per-voxel, per-frame opacity-weighted centroid (a snapshot)
+        std::unordered_map<Key, std::vector<FC>, KeyHash> grid;
+        grid.reserve(cloud.size()/2 + 1);
+        for (const auto & p : cloud) { if (!finite(p)) continue;
+            Key key{ vc(p.x,lo[0]), vc(p.y,lo[1]), vc(p.z,lo[2]) };
+            const double w = std::max((double)p.opacity, 1e-3);
+            auto & vec = grid[key]; bool hit=false;
+            for (auto & fc : vec) if (fc.f==p.frame) { fc.sx+=w*p.x; fc.sy+=w*p.y; fc.sz+=w*p.z; fc.w+=w; hit=true; break; }
+            if (!hit) vec.push_back({ p.frame, w*(double)p.x, w*(double)p.y, w*(double)p.z, w });
+        }
+        // pass 2: move each point toward the OTHER frames' consensus in its voxel
+        double dsum=0; int64_t dcnt=0;
+        for (auto & p : cloud) { if (!finite(p)) continue;
+            Key key{ vc(p.x,lo[0]), vc(p.y,lo[1]), vc(p.z,lo[2]) };
+            auto git = grid.find(key);
+            if (git == grid.end() || git->second.size() < 2) continue;
+            double tx=0,ty=0,tz=0,tw=0;
+            for (const auto & fc : git->second) { if (fc.f==p.frame) continue; tx+=fc.sx; ty+=fc.sy; tz+=fc.sz; tw+=fc.w; }
+            if (tw <= 0) continue;
+            tx/=tw; ty/=tw; tz/=tw;
+            const double dx=tx-p.x, dy=ty-p.y, dz=tz-p.z;
+            dsum += dx*dx+dy*dy+dz*dz; dcnt++;
+            p.x += (float)(alpha*dx); p.y += (float)(alpha*dy); p.z += (float)(alpha*dz);
+        }
+        disagree = (dcnt && ext > 0) ? std::sqrt(dsum/dcnt)/ext : 0.0;
+    }
+    return disagree;
 }
 
 // ---- loop closure ---------------------------------------------------------

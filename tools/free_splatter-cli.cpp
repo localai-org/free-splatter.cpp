@@ -143,9 +143,11 @@ int main(int argc, char ** argv) {
     const char * model = nullptr, * splat_prefix = nullptr;
     float opac_thr = 5e-3f;
     long  max_splats = 0;
-    bool  accumulate = false, fuse = false, fuse_keep = true;  // dense (kept) by default
+    bool  accumulate = false, fuse = false;
+    int   fuse_mode = 1;                         // 0 averaged, 1 kept, 2 best-frame
     float voxel = 0.02f, splat_scale = 1.0f;   // multiplier on the predicted gaussian radii
     int   fuse_k = 2;
+    bool  refine = false; int refine_iters = 8; float refine_voxel = 0.03f, refine_alpha = 0.5f;  // geometric de-ghost
     std::vector<std::string> inputs;
 
     for (int i = 1; i < argc; i++) {
@@ -161,7 +163,12 @@ int main(int argc, char ** argv) {
         else if (a == "--fuse")                         fuse = true;
         else if (a == "--voxel" && i+1 < argc)          voxel = (float) atof(argv[++i]);
         else if (a == "--fuse-k" && i+1 < argc)         fuse_k = atoi(argv[++i]);
-        else if (a == "--fuse-mode" && i+1 < argc)      fuse_keep = std::string(argv[++i]) != "averaged";
+        else if (a == "--fuse-mode" && i+1 < argc) { std::string m = argv[++i];
+            fuse_mode = (m=="averaged") ? 0 : (m=="best") ? 2 : 1; }
+        else if (a == "--refine")                       refine = true;
+        else if (a == "--refine-iters" && i+1 < argc)   refine_iters = atoi(argv[++i]);
+        else if (a == "--refine-voxel" && i+1 < argc)   refine_voxel = (float) atof(argv[++i]);
+        else if (a == "--refine-alpha" && i+1 < argc)   refine_alpha = (float) atof(argv[++i]);
         else if (a == "--splat-scale" && i+1 < argc)    splat_scale = (float) atof(argv[++i]);
         else if (a == "-h" || a == "--help")            return usage(argv[0]);
         else if (!model)                                model = argv[i];
@@ -242,6 +249,8 @@ int main(int argc, char ** argv) {
             if (splat_prefix) {
                 free_splatter_point * cloud = nullptr; size_t nc = 0;
                 free_splatter_accumulator_cloud(acc, &cloud, &nc);
+                if (refine && nframes >= 2)            // geometric de-ghost a copy (internal untouched)
+                    free_splatter_refine_cloud(cloud, nc, refine_voxel, refine_iters, refine_alpha);
                 char path[1024];
                 std::snprintf(path, sizeof path, "%s_%d.splat", splat_prefix, nframes);
                 write_cloud_splat(cloud, nc, (size_t) max_splats, splat_scale, path);
@@ -249,8 +258,9 @@ int main(int argc, char ** argv) {
             }
         }
         if (fuse && splat_prefix) {
+            if (refine) free_splatter_accumulator_refine(acc, refine_voxel, refine_iters, refine_alpha);
             free_splatter_point * fc = nullptr; size_t nf = 0;
-            free_splatter_accumulator_fuse(acc, voxel, fuse_k, fuse_keep ? 1 : 0, &fc, &nf);
+            free_splatter_accumulator_fuse(acc, voxel, fuse_k, fuse_mode, &fc, &nf);
             char path[1024];
             std::snprintf(path, sizeof path, "%s_fused.splat", splat_prefix);
             write_cloud_splat(fc, nf, (size_t) max_splats, splat_scale, path);

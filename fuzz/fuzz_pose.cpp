@@ -46,13 +46,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
             free_splatter_accumulator_add_pair(acc, g.data(), gc);
         }
         free_splatter_point * cloud = nullptr; size_t nc = 0;
-        if (free_splatter_accumulator_cloud(acc, &cloud, &nc) == 0) free_splatter_buf_free(cloud);
+        if (free_splatter_accumulator_cloud(acc, &cloud, &nc) == 0) {
+            free_splatter_refine_cloud(cloud, nc, 0.01f + (data[6] % 8) * 0.02f, 1 + (data[7] % 4), 0.5f);
+            free_splatter_buf_free(cloud);
+        }
+        free_splatter_accumulator_refine(acc, 0.03f, 2, 0.5f);   // de-ghost on garbage
 
         const float voxel = 0.005f + (data[3] % 16) * 0.01f;   // 0.005..0.155
         const int k = 1 + (data[4] % 4);                       // 1..4
-        const int keep_raw = data[5] & 1;                      // both fuse modes
+        const int mode = data[5] % 3;                          // averaged / kept / best
         free_splatter_point * fused = nullptr; size_t nf = 0;
-        if (free_splatter_accumulator_fuse(acc, voxel, k, keep_raw, &fused, &nf) == 0) free_splatter_buf_free(fused);
+        if (free_splatter_accumulator_fuse(acc, voxel, k, mode, &fused, &nf) == 0) free_splatter_buf_free(fused);
 
         float * path = nullptr; int32_t nfr = 0;
         if (free_splatter_accumulator_camera_path(acc, &path, &nfr) == 0) free_splatter_buf_free(path);
