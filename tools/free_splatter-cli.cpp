@@ -94,23 +94,37 @@ static bool write_splat(const float * g, size_t n, int gc, float opac_thr,
 }
 
 // Write an accumulated gaussian cloud as an antimatter15 .splat, emitting each
-// point's true anisotropic scale + rotation (carried through the Sim(3) by the
-// accumulator) so it renders as oriented splats, not isotropic dots. scale_mult
-// scales the radii (1.0 = as-predicted). Caps to max_splats by stride-subsampling.
+// point's true anisotropic scale + rotation (carried through the Sim(3)) AND its
+// activated opacity as the splat alpha — so it renders exactly like the single-run
+// write_splat (proper alpha blending), not a fully-opaque, swirling, blurry soup.
+// scale_mult scales the radii (1.0 = as-predicted). When capping, keep the most
+// important splats (opacity * volume), matching write_splat (not a uniform stride).
 static bool write_cloud_splat(const free_splatter_point * pts, size_t n, size_t max_splats,
                               float scale_mult, const char * path) {
-    const size_t stride = (max_splats > 0 && n > max_splats) ? (n + max_splats - 1) / max_splats : 1;
+    auto importance = [&](size_t i) -> double {
+        const free_splatter_point & p = pts[i];
+        const double vol = (double) std::max(p.sx,1e-9f) * std::max(p.sy,1e-9f) * std::max(p.sz,1e-9f);
+        return (double) std::max(p.opacity, 0.0f) * vol;
+    };
+    std::vector<size_t> idx(n);
+    for (size_t i = 0; i < n; i++) idx[i] = i;
+    if (max_splats > 0 && n > max_splats) {
+        std::partial_sort(idx.begin(), idx.begin() + max_splats, idx.end(),
+                          [&](size_t a, size_t b){ return importance(a) > importance(b); });
+        idx.resize(max_splats);
+    }
+
     std::ofstream f(path, std::ios::binary);
     if (!f) { std::fprintf(stderr, "cannot write %s\n", path); return false; }
     auto u8 = [](float v) -> unsigned char { float t = v < 0 ? 0 : v > 255 ? 255 : v; return (unsigned char) t; };
-    size_t written = 0;
-    for (size_t i = 0; i < n; i += stride) {
+    for (size_t i : idx) {
         const free_splatter_point & p = pts[i];
         // OpenCV (y down, z forward) -> viewer OpenGL (y up): negate y,z; quaternion
         // (w,x,y,z) -> (-x, w, -z, y) (the same remap as the single-run write_splat).
         float pos[3]   = { p.x, -p.y, -p.z };
         float sc[3]    = { scale_mult*p.sx, scale_mult*p.sy, scale_mult*p.sz };
-        unsigned char rgba[4] = { u8(p.r*255.0f), u8(p.g*255.0f), u8(p.b*255.0f), 255 };
+        unsigned char rgba[4] = { u8(p.r*255.0f), u8(p.g*255.0f), u8(p.b*255.0f),
+                                  u8(std::min(std::max(p.opacity, 0.0f), 1.0f) * 255.0f) };
         float q[4] = { -p.qx, p.qw, -p.qz, p.qy };
         float nrm = std::sqrt(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]) + 1e-12f;
         unsigned char rot[4];
@@ -119,9 +133,8 @@ static bool write_cloud_splat(const free_splatter_point * pts, size_t n, size_t 
         f.write((const char *) sc, 12);
         f.write((const char *) rgba, 4);
         f.write((const char *) rot, 4);
-        written++;
     }
-    std::printf("wrote %s: %zu splats (of %zu cloud points)\n", path, written, n);
+    std::printf("wrote %s: %zu splats (of %zu cloud points)\n", path, idx.size(), n);
     return true;
 }
 
