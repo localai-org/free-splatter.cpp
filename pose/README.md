@@ -48,8 +48,21 @@ test tier (`tests/test_pose.cpp`, `ctest -LE model`):
   per-link Sim(3) scale agrees to **mean 0.5%** (11/12 links <1%, worst on the
   documented low-inlier leg); trajectory within **6.6%** of the cv2 chain — the
   residual is the known RANSAC-RNG + EPnP-vs-SQPNP delta, not a port gap.
-- ⬜ Not yet ported: loop closure, consensus fusion (these compose the primitives
-  above), and the CLI / C-API surface.
+- ✅ **Loop closure → `sim4_invert` + `distribute_drift` (loop_closure.py)** — the
+  even Sim(3) relaxation: from an accumulated drift `D` (the loop-closure
+  measurement `P_n_loop · P_last⁻¹`), distribute `D^(k/n)` over the chain.
+  `sim_frac_power` (the closed-form one-parameter subgroup) is **numerically
+  identical to numpy's eig-based version (5e-10)** across f ∈ {−0.5 … 1.3};
+  `sim4_invert` is an exact similarity inverse (1e-9); golden test recovers a
+  known drifted loop to 4e-16. **Real-data parity** on the cached loopcache (13
+  chain pairs + `close_0_260`): the recovered drift matches the prototype's loop
+  error (scale 1.09 vs 1.12, **4.6° vs 4.4°**, README "4.4°"), deterministic
+  valid% identical; the corrected-trajectory delta is the (already-characterized)
+  EPnP-vs-cv2 PnP backend feeding `D`, since the distribution math itself is
+  bit-identical to numpy. Confirms the prototype's finding: on this short clip the
+  chain already closes, so loop closure is a near-identity correction.
+- ⬜ Not yet ported: consensus fusion (composes the primitives above), and the
+  CLI / C-API surface.
 
 ## Why it's needed
 
