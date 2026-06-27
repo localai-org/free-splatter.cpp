@@ -151,7 +151,7 @@ int main(int argc, char ** argv) {
     float opac_thr = 5e-3f;
     long  max_splats = 0;
     bool  accumulate = false, fuse = false;
-    float voxel = 0.02f, splat_scale = 0.0015f;
+    float voxel = 0.02f, splat_scale = 0.006f;   // splat radius as a fraction of cloud extent
     int   fuse_k = 2;
     std::vector<std::string> inputs;
 
