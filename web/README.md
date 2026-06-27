@@ -43,8 +43,11 @@ python3 -m http.server -d .cache/demo/accumulate 8080   # open http://localhost:
 
 URL params: `?ms=2600` step interval, `?start=N` begin at step N, `?auto=0` no
 auto-advance, `?spin=0` no auto-orbit. The cloud shown is the raw accumulated
-cloud; the bake also writes a consensus-fused `acc_fused.splat` (the edge-haze
-floaters removed), shown as a final step.
+cloud; the bake also writes a consensus-fused `acc_fused.splat` (single-view
+floaters removed — only voxels seen by ≥ K frames survive), shown as a final step.
+`--fuse-mode kept` (default) keeps every raw gaussian in a consensus voxel (dense);
+`--fuse-mode averaged` collapses each voxel to one denoised point (cleaner but
+sparse — only worthwhile with many overlapping frames).
 
 **Pick frames with lateral baseline.** Two-view depth needs the camera to
 *translate sideways* — a pure forward dolly (the camera moving along the direction

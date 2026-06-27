@@ -143,7 +143,7 @@ int main(int argc, char ** argv) {
     const char * model = nullptr, * splat_prefix = nullptr;
     float opac_thr = 5e-3f;
     long  max_splats = 0;
-    bool  accumulate = false, fuse = false;
+    bool  accumulate = false, fuse = false, fuse_keep = true;  // dense (kept) by default
     float voxel = 0.02f, splat_scale = 1.0f;   // multiplier on the predicted gaussian radii
     int   fuse_k = 2;
     std::vector<std::string> inputs;
@@ -161,6 +161,7 @@ int main(int argc, char ** argv) {
         else if (a == "--fuse")                         fuse = true;
         else if (a == "--voxel" && i+1 < argc)          voxel = (float) atof(argv[++i]);
         else if (a == "--fuse-k" && i+1 < argc)         fuse_k = atoi(argv[++i]);
+        else if (a == "--fuse-mode" && i+1 < argc)      fuse_keep = std::string(argv[++i]) != "averaged";
         else if (a == "--splat-scale" && i+1 < argc)    splat_scale = (float) atof(argv[++i]);
         else if (a == "-h" || a == "--help")            return usage(argv[0]);
         else if (!model)                                model = argv[i];
@@ -249,7 +250,7 @@ int main(int argc, char ** argv) {
         }
         if (fuse && splat_prefix) {
             free_splatter_point * fc = nullptr; size_t nf = 0;
-            free_splatter_accumulator_fuse(acc, voxel, fuse_k, &fc, &nf);
+            free_splatter_accumulator_fuse(acc, voxel, fuse_k, fuse_keep ? 1 : 0, &fc, &nf);
             char path[1024];
             std::snprintf(path, sizeof path, "%s_fused.splat", splat_prefix);
             write_cloud_splat(fc, nf, (size_t) max_splats, splat_scale, path);

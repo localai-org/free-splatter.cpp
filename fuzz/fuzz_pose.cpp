@@ -50,8 +50,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size) {
 
         const float voxel = 0.005f + (data[3] % 16) * 0.01f;   // 0.005..0.155
         const int k = 1 + (data[4] % 4);                       // 1..4
+        const int keep_raw = data[5] & 1;                      // both fuse modes
         free_splatter_point * fused = nullptr; size_t nf = 0;
-        if (free_splatter_accumulator_fuse(acc, voxel, k, &fused, &nf) == 0) free_splatter_buf_free(fused);
+        if (free_splatter_accumulator_fuse(acc, voxel, k, keep_raw, &fused, &nf) == 0) free_splatter_buf_free(fused);
 
         float * path = nullptr; int32_t nfr = 0;
         if (free_splatter_accumulator_camera_path(acc, &path, &nfr) == 0) free_splatter_buf_free(path);

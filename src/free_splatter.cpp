@@ -254,12 +254,12 @@ int free_splatter_accumulator_cloud(const free_splatter_accumulator * acc,
 }
 
 int free_splatter_accumulator_fuse(const free_splatter_accumulator * acc, float voxel_frac,
-                                   int32_t k, free_splatter_point ** out, size_t * n_out) {
+                                   int32_t k, int32_t keep_raw, free_splatter_point ** out, size_t * n_out) {
     if (out) *out = nullptr;
     if (n_out) *n_out = 0;
     if (!acc || !out || !n_out || k < 1 || !(voxel_frac > 0)) return -1;
     std::vector<free_splatter::pose::AccumPoint> fused;
-    free_splatter::pose::consensus_fuse(acc->acc.cloud(), voxel_frac, k, fused);
+    free_splatter::pose::consensus_fuse(acc->acc.cloud(), voxel_frac, k, fused, keep_raw != 0);
     return emit_points(fused, out, n_out);
 }
 

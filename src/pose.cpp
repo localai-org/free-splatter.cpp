@@ -1008,7 +1008,7 @@ std::vector<Mat4> Accumulator::camera_path() const {
 // ---- consensus fusion -----------------------------------------------------
 
 FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_frac, int k,
-                         std::vector<AccumPoint> & fused) {
+                         std::vector<AccumPoint> & fused, bool keep_raw) {
     fused.clear();
     FuseStats st{};
     st.raw_points = (int64_t) cloud.size();
@@ -1073,20 +1073,37 @@ FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_fra
 
     st.voxels = (int64_t) grid.size();
     for (const auto & kv : grid) {
-        const Vox & vx = kv.second;
-        if ((int) vx.frames.size() < k) continue;
+        if ((int) kv.second.frames.size() < k) continue;
         st.kept_voxels++;
-        st.points_kept += vx.cnt;
-        AccumPoint p;
-        p.x = (float) (vx.sx / vx.cnt); p.y = (float) (vx.sy / vx.cnt); p.z = (float) (vx.sz / vx.cnt);
-        p.r = (float) (vx.sr / vx.cnt); p.g = (float) (vx.sg / vx.cnt); p.b = (float) (vx.sb / vx.cnt);
-        p.opacity = (float) (vx.sop / vx.cnt);
-        p.sx = (float) (vx.ssx / vx.cnt); p.sy = (float) (vx.ssy / vx.cnt); p.sz = (float) (vx.ssz / vx.cnt);
-        p.qw = vx.q[0]; p.qx = vx.q[1]; p.qy = vx.q[2]; p.qz = vx.q[3];
-        p.frame = (int32_t) vx.frames.size();   // support count (informational)
-        fused.push_back(p);
+        st.points_kept += kv.second.cnt;
     }
     st.points_dropped = st.raw_points - st.points_kept;
+
+    if (keep_raw) {
+        // DENSE: keep every raw gaussian whose voxel is corroborated by >= k frames
+        // (floaters dropped, nothing averaged/decimated away).
+        fused.reserve((size_t) st.points_kept);
+        for (const auto & p : cloud) {
+            if (!finite(p)) continue;
+            Key key{ vcoord(p.x, lo[0]), vcoord(p.y, lo[1]), vcoord(p.z, lo[2]) };
+            auto it = grid.find(key);
+            if (it != grid.end() && (int) it->second.frames.size() >= k) fused.push_back(p);
+        }
+    } else {
+        // DENOISED: one averaged gaussian per consensus voxel.
+        for (const auto & kv : grid) {
+            const Vox & vx = kv.second;
+            if ((int) vx.frames.size() < k) continue;
+            AccumPoint p;
+            p.x = (float) (vx.sx / vx.cnt); p.y = (float) (vx.sy / vx.cnt); p.z = (float) (vx.sz / vx.cnt);
+            p.r = (float) (vx.sr / vx.cnt); p.g = (float) (vx.sg / vx.cnt); p.b = (float) (vx.sb / vx.cnt);
+            p.opacity = (float) (vx.sop / vx.cnt);
+            p.sx = (float) (vx.ssx / vx.cnt); p.sy = (float) (vx.ssy / vx.cnt); p.sz = (float) (vx.ssz / vx.cnt);
+            p.qw = vx.q[0]; p.qx = vx.q[1]; p.qy = vx.q[2]; p.qz = vx.q[3];
+            p.frame = (int32_t) vx.frames.size();   // support count (informational)
+            fused.push_back(p);
+        }
+    }
     return st;
 }
 

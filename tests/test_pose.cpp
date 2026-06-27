@@ -543,9 +543,13 @@ static void test_consensus_fuse() {
     FuseStats st = consensus_fuse(cloud, /*voxel_frac=*/0.02, /*k=*/2, fused);
     check("raw points", st.raw_points == 35);
     check("kept voxels (the surface)", st.kept_voxels == 5);
-    check("fused size", fused.size() == 5);
+    check("fused size (averaged: one per voxel)", fused.size() == 5);
     check("points kept", st.points_kept == 15);
     check("floaters dropped", st.points_dropped == 20);
+    // keep_raw=true: dense — every raw point in a consensus voxel, floaters dropped
+    std::vector<AccumPoint> kept;
+    consensus_fuse(cloud, /*voxel_frac=*/0.02, /*k=*/2, kept, /*keep_raw=*/true);
+    check("kept mode: dense (all 15 consensus raw points)", kept.size() == 15);
     // a fused point sits at its cluster centroid (~2*loc), color preserved
     bool centroid_ok = true;
     for (const auto & p : fused) {

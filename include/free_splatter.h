@@ -126,10 +126,12 @@ FREE_SPLATTER_API int free_splatter_accumulator_cloud(
     const free_splatter_accumulator * acc, free_splatter_point ** out, size_t * n_out);
 
 // Consensus-fuse the current cloud: keep only voxels (size voxel_frac * extent)
-// corroborated by >= k distinct source frames, averaging the agreeing predictions.
-// *out malloc'd as above. Returns 0 on success, -1 on failure.
+// corroborated by >= k distinct source frames (single-frame floaters dropped).
+// keep_raw=0 averages each consensus voxel to one point (denoised but decimated);
+// keep_raw=1 keeps every raw gaussian in a consensus voxel (dense, nothing averaged
+// away — better when there are few frames). *out malloc'd as above. Returns 0 ok.
 FREE_SPLATTER_API int free_splatter_accumulator_fuse(
-    const free_splatter_accumulator * acc, float voxel_frac, int32_t k,
+    const free_splatter_accumulator * acc, float voxel_frac, int32_t k, int32_t keep_raw,
     free_splatter_point ** out, size_t * n_out);
 
 // Copy the global camera trajectory: *out malloc'd (*n_frames)*16 float32, a
