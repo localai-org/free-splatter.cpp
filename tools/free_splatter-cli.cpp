@@ -93,32 +93,28 @@ static bool write_splat(const float * g, size_t n, int gc, float opac_thr,
     return true;
 }
 
-// Write an accumulated point cloud (xyz + rgb, no per-point covariance) as an
-// antimatter15 .splat, each point a small isotropic gaussian. Caps to max_splats
-// by stride-subsampling. scale_frac sets the splat radius as a fraction of the
-// cloud's rms extent.
+// Write an accumulated gaussian cloud as an antimatter15 .splat, emitting each
+// point's true anisotropic scale + rotation (carried through the Sim(3) by the
+// accumulator) so it renders as oriented splats, not isotropic dots. scale_mult
+// scales the radii (1.0 = as-predicted). Caps to max_splats by stride-subsampling.
 static bool write_cloud_splat(const free_splatter_point * pts, size_t n, size_t max_splats,
-                              float scale_frac, const char * path) {
-    // rms extent about the centroid -> per-point isotropic scale
-    double m[3] = {0,0,0};
-    for (size_t i = 0; i < n; i++) { m[0]+=pts[i].x; m[1]+=pts[i].y; m[2]+=pts[i].z; }
-    if (n) { m[0]/=n; m[1]/=n; m[2]/=n; }
-    double ss = 0;
-    for (size_t i = 0; i < n; i++) { const double dx=pts[i].x-m[0], dy=pts[i].y-m[1], dz=pts[i].z-m[2]; ss += dx*dx+dy*dy+dz*dz; }
-    const float ext = (float) std::sqrt(ss / (n ? n : 1));
-    const float scale = std::max(scale_frac * ext, 1e-6f);
-
+                              float scale_mult, const char * path) {
     const size_t stride = (max_splats > 0 && n > max_splats) ? (n + max_splats - 1) / max_splats : 1;
     std::ofstream f(path, std::ios::binary);
     if (!f) { std::fprintf(stderr, "cannot write %s\n", path); return false; }
     auto u8 = [](float v) -> unsigned char { float t = v < 0 ? 0 : v > 255 ? 255 : v; return (unsigned char) t; };
     size_t written = 0;
     for (size_t i = 0; i < n; i += stride) {
-        // OpenCV (y down, z forward) -> viewer OpenGL (y up): negate y,z.
-        float pos[3]   = { pts[i].x, -pts[i].y, -pts[i].z };
-        float sc[3]    = { scale, scale, scale };
-        unsigned char rgba[4] = { u8(pts[i].r*255.0f), u8(pts[i].g*255.0f), u8(pts[i].b*255.0f), 255 };
-        unsigned char rot[4]  = { 255, 128, 128, 128 };   // identity quaternion (w,x,y,z)
+        const free_splatter_point & p = pts[i];
+        // OpenCV (y down, z forward) -> viewer OpenGL (y up): negate y,z; quaternion
+        // (w,x,y,z) -> (-x, w, -z, y) (the same remap as the single-run write_splat).
+        float pos[3]   = { p.x, -p.y, -p.z };
+        float sc[3]    = { scale_mult*p.sx, scale_mult*p.sy, scale_mult*p.sz };
+        unsigned char rgba[4] = { u8(p.r*255.0f), u8(p.g*255.0f), u8(p.b*255.0f), 255 };
+        float q[4] = { -p.qx, p.qw, -p.qz, p.qy };
+        float nrm = std::sqrt(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]) + 1e-12f;
+        unsigned char rot[4];
+        for (int c = 0; c < 4; c++) rot[c] = u8(q[c]/nrm * 128.0f + 128.0f);
         f.write((const char *) pos, 12);
         f.write((const char *) sc, 12);
         f.write((const char *) rgba, 4);
@@ -151,7 +147,7 @@ int main(int argc, char ** argv) {
     float opac_thr = 5e-3f;
     long  max_splats = 0;
     bool  accumulate = false, fuse = false;
-    float voxel = 0.02f, splat_scale = 0.006f;   // splat radius as a fraction of cloud extent
+    float voxel = 0.02f, splat_scale = 1.0f;   // multiplier on the predicted gaussian radii
     int   fuse_k = 2;
     std::vector<std::string> inputs;
 

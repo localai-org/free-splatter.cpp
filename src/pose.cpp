@@ -854,6 +854,38 @@ PoseResult estimate_poses(const std::vector<const float *> & points,
 namespace {
 inline float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
 const double SH_C0 = 0.28209479177387814;   // SH degree-0 basis (DC -> rgb)
+
+// quaternion (w,x,y,z) from a rotation matrix (Shepperd's method)
+std::array<double,4> mat3_to_quat(const Mat3 & R) {
+    const double tr = R(0,0) + R(1,1) + R(2,2);
+    double w,x,y,z;
+    if (tr > 0) {
+        double s = std::sqrt(tr + 1.0) * 2;
+        w = 0.25*s; x = (R(2,1)-R(1,2))/s; y = (R(0,2)-R(2,0))/s; z = (R(1,0)-R(0,1))/s;
+    } else if (R(0,0) > R(1,1) && R(0,0) > R(2,2)) {
+        double s = std::sqrt(1.0 + R(0,0) - R(1,1) - R(2,2)) * 2;
+        w = (R(2,1)-R(1,2))/s; x = 0.25*s; y = (R(0,1)+R(1,0))/s; z = (R(0,2)+R(2,0))/s;
+    } else if (R(1,1) > R(2,2)) {
+        double s = std::sqrt(1.0 + R(1,1) - R(0,0) - R(2,2)) * 2;
+        w = (R(0,2)-R(2,0))/s; x = (R(0,1)+R(1,0))/s; y = 0.25*s; z = (R(1,2)+R(2,1))/s;
+    } else {
+        double s = std::sqrt(1.0 + R(2,2) - R(0,0) - R(1,1)) * 2;
+        w = (R(1,0)-R(0,1))/s; x = (R(0,2)+R(2,0))/s; y = (R(1,2)+R(2,1))/s; z = 0.25*s;
+    }
+    return {w,x,y,z};
+}
+// Hamilton product (w,x,y,z): compose rotation a then... q = a ⊗ b applies b first.
+std::array<double,4> quat_mul(const std::array<double,4> & a, const std::array<double,4> & b) {
+    return { a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3],
+             a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2],
+             a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1],
+             a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0] };
+}
+std::array<double,4> quat_normalize(std::array<double,4> q) {
+    const double n = std::sqrt(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]);
+    if (n > 1e-12) for (auto & c : q) c /= n; else q = {1,0,0,0};
+    return q;
+}
 } // namespace
 
 Accumulator::Accumulator(int H, int W, double opacity_threshold,
@@ -862,8 +894,12 @@ Accumulator::Accumulator(int H, int W, double opacity_threshold,
       riters_(ransac_iters), seed_(seed), T_(sim_identity()), final_cam_(mat4_identity()) {}
 
 void Accumulator::add_view(const float * pts, const float * op, const float * rgb,
-                           const Sim3 & T, int frame) {
+                           const float * scl, const float * rot, const Sim3 & T, int frame) {
     const int P = H_ * W_;
+    // A similarity x -> s*(R@x)+t scales each gaussian's covariance by s^2 and
+    // rotates it by R: so the world-frame axis lengths are s*scale and the world
+    // rotation is qT ⊗ q_local. Compute qT (from T.R) once for the whole view.
+    const std::array<double,4> qT = mat3_to_quat(T.R);
     for (int i = 0; i < P; i++) {
         if (op[i] <= thr_) continue;
         Vec3 x = { pts[3*i], pts[3*i+1], pts[3*i+2] };
@@ -871,6 +907,10 @@ void Accumulator::add_view(const float * pts, const float * op, const float * rg
         AccumPoint p;
         p.x = (float) w[0]; p.y = (float) w[1]; p.z = (float) w[2];
         p.r = rgb[3*i]; p.g = rgb[3*i+1]; p.b = rgb[3*i+2];
+        p.sx = (float) (T.s * scl[3*i]); p.sy = (float) (T.s * scl[3*i+1]); p.sz = (float) (T.s * scl[3*i+2]);
+        std::array<double,4> ql = quat_normalize({ rot[4*i], rot[4*i+1], rot[4*i+2], rot[4*i+3] });
+        std::array<double,4> qw = quat_normalize(quat_mul(qT, ql));
+        p.qw = (float) qw[0]; p.qx = (float) qw[1]; p.qy = (float) qw[2]; p.qz = (float) qw[3];
         p.frame = frame;
         cloud_.push_back(p);
     }
@@ -881,6 +921,7 @@ ChainLink Accumulator::add_pair(const float * g, int gc, double focal) {
     // de-interleave the two views: points (ch 0:3), opacity (ch 15, already
     // sigmoid-activated), rgb = clip(SH_DC * C0 + 0.5, 0, 1) (ch 3:6).
     std::vector<float> pts0(3*P), pts1(3*P), op0(P), op1(P), rgb0(3*P), rgb1(3*P);
+    std::vector<float> scl0(3*P), scl1(3*P), rot0(4*P), rot1(4*P);
     for (int i = 0; i < P; i++) {
         const float * a0 = g + (size_t) i * gc;
         const float * a1 = g + (size_t) (P + i) * gc;
@@ -890,6 +931,9 @@ ChainLink Accumulator::add_pair(const float * g, int gc, double focal) {
             rgb0[3*i+c] = clamp01((float) (a0[3+c] * SH_C0 + 0.5));
             rgb1[3*i+c] = clamp01((float) (a1[3+c] * SH_C0 + 0.5));
         }
+        // gaussian shape: scale ch16:19, rotation quaternion (w,x,y,z) ch19:23
+        for (int c = 0; c < 3; c++) { scl0[3*i+c] = a0[16+c]; scl1[3*i+c] = a1[16+c]; }
+        for (int c = 0; c < 4; c++) { rot0[4*i+c] = a0[19+c]; rot1[4*i+c] = a1[19+c]; }
     }
 
     // recover this pair's cameras (view-0 frame, use_first_focal)
@@ -904,8 +948,8 @@ ChainLink Accumulator::add_pair(const float * g, int gc, double focal) {
         link.sim = sim_identity();
         link.global = T_;
         link.scale = 1.0; link.inlier_frac = 1.0; link.valid_frac = 1.0; link.resid_frac = 0.0;
-        add_view(pts0.data(), op0.data(), rgb0.data(), T_, next_frame_++);   // f_0
-        add_view(pts1.data(), op1.data(), rgb1.data(), T_, next_frame_++);   // f_1
+        add_view(pts0.data(), op0.data(), rgb0.data(), scl0.data(), rot0.data(), T_, next_frame_++);   // f_0
+        add_view(pts1.data(), op1.data(), rgb1.data(), scl1.data(), rot1.data(), T_, next_frame_++);   // f_1
     } else {
         // fit Sim(3) from this run's view 0 (the shared frame, run-k coords) to the
         // previous run's view 1 (same frame, run-(k-1) coords). Mask = valid in both.
@@ -940,7 +984,7 @@ ChainLink Accumulator::add_pair(const float * g, int gc, double focal) {
         link.valid_frac  = (double) n / P;
         link.resid_frac  = (scene > 0 && n_inl > 0) ? rms3(rA.data(), n_inl) / scene : 0.0;
 
-        add_view(pts1.data(), op1.data(), rgb1.data(), T_, next_frame_++);   // f_{k+1}
+        add_view(pts1.data(), op1.data(), rgb1.data(), scl1.data(), rot1.data(), T_, next_frame_++);   // f_{k+1}
     }
 
     cams_.push_back(mat4_mul(sim_matrix(T_), c2w0));     // frame f_k camera (view 0)
@@ -997,7 +1041,8 @@ FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_fra
     const double v = voxel_frac * ext;
     if (!(v > 0)) return st;
 
-    struct Vox { double sx=0,sy=0,sz=0,sr=0,sg=0,sb=0; int64_t cnt=0; std::vector<int32_t> frames; };
+    struct Vox { double sx=0,sy=0,sz=0,sr=0,sg=0,sb=0; double ssx=0,ssy=0,ssz=0; int64_t cnt=0;
+                 float q[4]={1,0,0,0}; bool has_q=false; std::vector<int32_t> frames; };
     struct Key { int32_t i,j,k; bool operator==(const Key&o) const { return i==o.i&&j==o.j&&k==o.k; } };
     struct KeyHash { size_t operator()(const Key&q) const {
         uint64_t h = (uint64_t)(uint32_t)q.i * 0x9E3779B97F4A7C15ULL;
@@ -1019,6 +1064,8 @@ FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_fra
         Key key{ vcoord(p.x, lo[0]), vcoord(p.y, lo[1]), vcoord(p.z, lo[2]) };
         Vox & vx = grid[key];
         vx.sx+=p.x; vx.sy+=p.y; vx.sz+=p.z; vx.sr+=p.r; vx.sg+=p.g; vx.sb+=p.b; vx.cnt++;
+        vx.ssx+=p.sx; vx.ssy+=p.sy; vx.ssz+=p.sz;
+        if (!vx.has_q) { vx.q[0]=p.qw; vx.q[1]=p.qx; vx.q[2]=p.qy; vx.q[3]=p.qz; vx.has_q=true; } // representative orientation
         bool seen = false;
         for (int32_t f : vx.frames) if (f == p.frame) { seen = true; break; }
         if (!seen) vx.frames.push_back(p.frame);
@@ -1033,6 +1080,8 @@ FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_fra
         AccumPoint p;
         p.x = (float) (vx.sx / vx.cnt); p.y = (float) (vx.sy / vx.cnt); p.z = (float) (vx.sz / vx.cnt);
         p.r = (float) (vx.sr / vx.cnt); p.g = (float) (vx.sg / vx.cnt); p.b = (float) (vx.sb / vx.cnt);
+        p.sx = (float) (vx.ssx / vx.cnt); p.sy = (float) (vx.ssy / vx.cnt); p.sz = (float) (vx.ssz / vx.cnt);
+        p.qw = vx.q[0]; p.qx = vx.q[1]; p.qy = vx.q[2]; p.qz = vx.q[3];
         p.frame = (int32_t) vx.frames.size();   // support count (informational)
         fused.push_back(p);
     }

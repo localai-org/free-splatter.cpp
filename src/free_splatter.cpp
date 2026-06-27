@@ -191,6 +191,8 @@ int emit_points(const std::vector<free_splatter::pose::AccumPoint> & src,
     for (size_t i = 0; i < src.size(); i++) {
         (*out)[i].x = src[i].x; (*out)[i].y = src[i].y; (*out)[i].z = src[i].z;
         (*out)[i].r = src[i].r; (*out)[i].g = src[i].g; (*out)[i].b = src[i].b;
+        (*out)[i].sx = src[i].sx; (*out)[i].sy = src[i].sy; (*out)[i].sz = src[i].sz;
+        (*out)[i].qw = src[i].qw; (*out)[i].qx = src[i].qx; (*out)[i].qy = src[i].qy; (*out)[i].qz = src[i].qz;
         (*out)[i].frame = src[i].frame;
     }
     *n_out = src.size();
