@@ -8,10 +8,12 @@
 // quantities, not bitstream-matched), so this validates the C++ port to the same
 // correctness bar the Python prototype meets, independently of numpy.
 #include "pose.h"
+#include "splat.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -582,6 +584,83 @@ static void test_loop_distribute() {
     check("distribute_drift recovers clean loop", std::sqrt(post/(n+1)) < 1e-9, buf);
 }
 
+// ===========================================================================
+// Regression guards for the gaussian -> .splat seam (the class of bug that
+// dropped rotation, then opacity, from the accumulated cloud writer)
+// ===========================================================================
+
+// #1 guard: pin the shared encoder's byte output. Both writers (single-run and
+// accumulated cloud) call this; if it ever drops a channel or changes the
+// convention the bytes change here. The opacity->alpha byte is the exact field
+// the regression got wrong (it had been forced to 255).
+static void test_splat_record() {
+    std::printf("test_splat_record\n");
+    const float pos[3]   = { 1.0f, 2.0f, 3.0f };
+    const float scale[3] = { 0.01f, 0.02f, 0.03f };
+    const float quat[4]  = { 0.70710678f, 0.70710678f, 0.0f, 0.0f };  // (w,x,y,z), unit
+    const float rgb[3]   = { 0.2f, 0.4f, 0.6f };
+    unsigned char rec[32];
+    free_splatter::encode_splat_record(rec, pos, scale, quat, rgb, 0.5f);
+
+    float p[3], sc[3]; std::memcpy(p, rec, 12); std::memcpy(sc, rec+12, 12);
+    check("pos: OpenCV->GL flips y,z", p[0]==1.0f && p[1]==-2.0f && p[2]==-3.0f);
+    check("scale: passthrough", sc[0]==0.01f && sc[1]==0.02f && sc[2]==0.03f);
+    check("rgb bytes", rec[24]==(unsigned char)(0.2f*255.0f) &&
+                       rec[25]==(unsigned char)(0.4f*255.0f) &&
+                       rec[26]==(unsigned char)(0.6f*255.0f));
+    // THE regression field: opacity must become the alpha, not a forced 255.
+    char buf[48]; std::snprintf(buf, sizeof buf, "alpha=%d (must be 127, not 255)", rec[27]);
+    check("opacity -> alpha (not forced opaque)", rec[27] == 127, buf);
+    // rotation must be encoded with the (w,x,y,z)->(-x,w,-z,y) remap, not dropped.
+    // q=(0.7071,0.7071,0,0) -> (-0.7071,0.7071,0,0) -> bytes (37,218,128,128).
+    check("rotation: remap encoded (not identity)",
+          rec[28]==37 && rec[29]==218 && rec[30]==128 && rec[31]==128);
+    // boundary opacities
+    unsigned char r1[32], r0[32];
+    free_splatter::encode_splat_record(r1, pos, scale, quat, rgb, 1.0f);
+    free_splatter::encode_splat_record(r0, pos, scale, quat, rgb, 0.0f);
+    check("alpha boundaries (1->255, 0->0)", r1[27]==255 && r0[27]==0);
+}
+
+// #2 guard: run-0 accumulation must preserve EVERY gaussian channel. With one pair
+// the global transform is identity, so each AccumPoint should equal the engine's
+// gaussian for that pixel (xyz, SH->rgb, opacity, scale, rotation, frame). A
+// dropped channel — the exact bug — fails here, asset-free.
+static void test_accumulate_channels() {
+    std::printf("test_accumulate_channels\n");
+    const int H = 4, W = 4, gc = 23, P = H*W;
+    std::vector<float> g((size_t) 2 * P * gc, 0.0f);
+    for (int v = 0; v < 2; v++) for (int i = 0; i < P; i++) {
+        float * a = &g[(size_t)(v*P + i) * gc];
+        const float b = (float)(v*100 + i);
+        a[0]=b+0.11f; a[1]=b+0.22f; a[2]=b+0.33f;               // xyz (distinct)
+        a[3]=0.5f; a[4]=-0.5f; a[5]=1.0f;                       // SH-DC -> in-range rgb
+        a[15]=0.2f + 0.5f*((i%3)/2.0f);                         // opacity in {0.2,0.45,0.7} > thr
+        a[16]=0.01f+0.001f*i; a[17]=0.02f; a[18]=0.03f;         // scale (distinct)
+        a[19]=0.8f; a[20]=0.6f; a[21]=0.0f; a[22]=0.0f;         // unit quat (w,x,y,z)
+    }
+    Accumulator acc(H, W, /*opacity_threshold=*/0.05);
+    acc.add_pair(g.data(), gc);
+    const auto & cloud = acc.cloud();
+    check("run-0 cloud = all pixels (both views kept)", cloud.size() == (size_t) 2 * P);
+
+    const double C0 = 0.28209479177387814;
+    bool ok = cloud.size() == (size_t) 2 * P;
+    auto cl = [](float x, float y) { return std::fabs(x - y) < 1e-5f; };
+    for (int v = 0; v < 2 && ok; v++) for (int i = 0; i < P && ok; i++) {
+        const float * a = &g[(size_t)(v*P + i) * gc];
+        const AccumPoint & p = cloud[(size_t) v*P + i];
+        ok &= cl(p.x,a[0]) && cl(p.y,a[1]) && cl(p.z,a[2]);                 // xyz (identity sim)
+        float er=(float)(a[3]*C0+0.5), eg=(float)(a[4]*C0+0.5), eb=(float)(a[5]*C0+0.5);
+        ok &= cl(p.r,er) && cl(p.g,eg) && cl(p.b,eb);                       // SH -> rgb
+        ok &= cl(p.opacity,a[15]);                                          // opacity (the dropped one)
+        ok &= cl(p.sx,a[16]) && cl(p.sy,a[17]) && cl(p.sz,a[18]);           // scale (T.s=1)
+        ok &= cl(p.qw,a[19]) && cl(p.qx,a[20]) && cl(p.qy,a[21]) && cl(p.qz,a[22]); // rotation
+        ok &= (p.frame == v);                                              // source frame
+    }
+    check("every gaussian channel survives run-0 accumulation", ok);
+}
+
 int main() {
     test_similarity_roundtrip();
     test_scale_detection();
@@ -598,6 +677,8 @@ int main() {
     test_accumulate_chain();
     test_consensus_fuse();
     test_loop_distribute();
+    test_splat_record();
+    test_accumulate_channels();
     std::printf(failures ? "\ntest_pose: %d FAILURES\n" : "\ntest_pose: ok\n", failures);
     return failures ? 1 : 0;
 }
