@@ -8,6 +8,7 @@
 //                     [--opacity-threshold T] [--max-splats N] [--dump-taps DIR]
 //                     MODEL.gguf  (IMAGES... | INPUT.f32)
 #include "free_splatter.h"
+#include "splat.h"              // the single shared .splat record encoder
 
 #include "stb_image.h"          // implementation in tools/stb_impl.cpp
 #include "stb_image_resize2.h"
@@ -70,24 +71,15 @@ static bool write_splat(const float * g, size_t n, int gc, float opac_thr,
 
     std::ofstream f(path, std::ios::binary);
     if (!f) { std::fprintf(stderr, "cannot write %s\n", path); return false; }
-    auto u8 = [](float v) -> unsigned char { float t = v < 0 ? 0 : v > 255 ? 255 : v; return (unsigned char) t; };
     for (size_t k = 0; k < m; k++) {
         const float * x = &g[keep[k].second * gc];
-        // FreeSplatter's reference frame is OpenCV (y down, z forward); convert
-        // to the viewer's OpenGL convention (y up) via a 180deg rotation about X
-        // = diag(1,-1,-1): position.yz negate, quaternion (w,x,y,z)->(-x,w,-z,y).
-        float pos[3]   = { x[0], -x[1], -x[2] };
-        float scale[3] = { x[16], x[17], x[18] };
-        unsigned char rgba[4], rot[4];
-        for (int c = 0; c < 3; c++) { float v = 0.5f + (float) C0 * x[3+c]; rgba[c] = u8((v<0?0:v>1?1:v) * 255.0f); }
-        rgba[3] = u8(std::min(std::max(x[15], 0.0f), 1.0f) * 255.0f);
-        float q[4] = { -x[20], x[19], -x[22], x[21] };
-        float nrm = std::sqrt(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]) + 1e-12f;
-        for (int c = 0; c < 4; c++) rot[c] = u8(q[c]/nrm * 128.0f + 128.0f);
-        f.write((const char *) pos, 12);
-        f.write((const char *) scale, 12);
-        f.write((const char *) rgba, 4);
-        f.write((const char *) rot, 4);
+        const float pos[3]   = { x[0], x[1], x[2] };           // OpenCV; the encoder flips y,z
+        const float scale[3] = { x[16], x[17], x[18] };
+        const float quat[4]  = { x[19], x[20], x[21], x[22] };  // (w,x,y,z)
+        const float rgb[3]   = { 0.5f + (float) C0 * x[3], 0.5f + (float) C0 * x[4], 0.5f + (float) C0 * x[5] };
+        unsigned char rec[32];
+        free_splatter::encode_splat_record(rec, pos, scale, quat, rgb, x[15]);
+        f.write((const char *) rec, 32);
     }
     std::printf("wrote %s: %zu splats (pruned/cap of %zu kept)\n", path, m, keep.size());
     return true;
@@ -116,23 +108,15 @@ static bool write_cloud_splat(const free_splatter_point * pts, size_t n, size_t 
 
     std::ofstream f(path, std::ios::binary);
     if (!f) { std::fprintf(stderr, "cannot write %s\n", path); return false; }
-    auto u8 = [](float v) -> unsigned char { float t = v < 0 ? 0 : v > 255 ? 255 : v; return (unsigned char) t; };
     for (size_t i : idx) {
         const free_splatter_point & p = pts[i];
-        // OpenCV (y down, z forward) -> viewer OpenGL (y up): negate y,z; quaternion
-        // (w,x,y,z) -> (-x, w, -z, y) (the same remap as the single-run write_splat).
-        float pos[3]   = { p.x, -p.y, -p.z };
-        float sc[3]    = { scale_mult*p.sx, scale_mult*p.sy, scale_mult*p.sz };
-        unsigned char rgba[4] = { u8(p.r*255.0f), u8(p.g*255.0f), u8(p.b*255.0f),
-                                  u8(std::min(std::max(p.opacity, 0.0f), 1.0f) * 255.0f) };
-        float q[4] = { -p.qx, p.qw, -p.qz, p.qy };
-        float nrm = std::sqrt(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]) + 1e-12f;
-        unsigned char rot[4];
-        for (int c = 0; c < 4; c++) rot[c] = u8(q[c]/nrm * 128.0f + 128.0f);
-        f.write((const char *) pos, 12);
-        f.write((const char *) sc, 12);
-        f.write((const char *) rgba, 4);
-        f.write((const char *) rot, 4);
+        const float pos[3]   = { p.x, p.y, p.z };               // OpenCV; the encoder flips y,z
+        const float scale[3] = { scale_mult*p.sx, scale_mult*p.sy, scale_mult*p.sz };
+        const float quat[4]  = { p.qw, p.qx, p.qy, p.qz };      // (w,x,y,z)
+        const float rgb[3]   = { p.r, p.g, p.b };
+        unsigned char rec[32];
+        free_splatter::encode_splat_record(rec, pos, scale, quat, rgb, p.opacity);
+        f.write((const char *) rec, 32);
     }
     std::printf("wrote %s: %zu splats (of %zu cloud points)\n", path, idx.size(), n);
     return true;
