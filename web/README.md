@@ -42,12 +42,27 @@ python3 -m http.server -d .cache/demo/accumulate 8080   # open http://localhost:
 ```
 
 URL params: `?ms=2600` step interval, `?start=N` begin at step N, `?auto=0` no
-auto-advance, `?spin=0` no auto-orbit. The cloud shown is the raw accumulated
-cloud; the bake also writes a consensus-fused `acc_fused.splat` (single-view
-floaters removed — only voxels seen by ≥ K frames survive), shown as a final step.
-`--fuse-mode kept` (default) keeps every raw gaussian in a consensus voxel (dense);
-`--fuse-mode averaged` collapses each voxel to one denoised point (cleaner but
-sparse — only worthwhile with many overlapping frames).
+auto-advance, `?spin=0` no auto-orbit. The bake also writes a consensus-fused
+`acc_fused.splat` (single-view floaters removed — only voxels seen by ≥ K frames
+survive), shown as a final step. `--fuse-mode kept` keeps every raw gaussian in a
+consensus voxel (dense); `best` keeps only the most-confident frame per voxel
+(dense AND de-ghosted); `averaged` collapses each voxel to one denoised point
+(cleaner but sparse — only worthwhile with many overlapping frames).
+
+**De-ghosting.** Pairwise chaining leaves per-object misregistration, so
+overlapping frames show doubled objects. `--refine` (on by default in the bake;
+`REFINE=0` to disable) runs a gaussian-level consensus refinement that
+non-rigidly pulls each point toward the agreement of the other frames — ~5× less
+ghosting on real clips. (A rigid per-frame pose bundle-adjust does **not** help
+here: the residual is per-object reconstruction disagreement, not camera-pose
+error.)
+
+**Pick frames with lateral baseline.** Two-view depth needs the camera to
+*translate sideways* — a pure forward dolly (the camera moving along the direction
+it faces) gives near-zero parallax and reconstructs blurry. Frames a few apart
+from an orbiting / strafing clip work far better than tightly-spaced frames of a
+walk-forward clip. Rule of thumb: the per-pair lateral baseline should be a few %
+of scene depth or more (`scripts/` had a `baseline` probe in git history).
 
 **Pick frames with lateral baseline.** Two-view depth needs the camera to
 *translate sideways* — a pure forward dolly (the camera moving along the direction
