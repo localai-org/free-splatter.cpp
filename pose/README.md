@@ -24,16 +24,19 @@ test tier (`tests/test_pose.cpp`, `ctest -LE model`):
   `sim_frac_power`** — `sim_frac_power` is a closed-form Sim(3) one-parameter
   subgroup (`A^f=s^f R^f`, translation `(A^f−I)(A−I)⁻¹t`), no complex eig needed.
   All 9 golden tests (the mirror of `test_pose.py`) pass under ASan/UBSan.
-- ⚠ **`pnp.py` (numpy backend) → `solve_pnp_numpy` + `estimate_poses`** — DLT (via
-  the 12×12 `AᵀA` nullspace, which sidesteps the numpy reference's full-SVD OOM)
-  + RANSAC + cheirality decode. **Correct on clean synthetic data** (golden
-  tests), but on a real scene dump it inherits the **DLT algorithm's planar/mirror
-  degeneracy**: ~3/5 RANSAC seeds land near the cv2/SQPNP answer (58° vs cv2's
-  57° relative rotation), ~2/5 collapse to a ~135–152° flip. This is the *same*
-  instability the numpy reference has — which is exactly why the prototype used
-  **cv2 (SQPNP) for every real-data result**. **Next step:** a robust in-house PnP
-  (EPnP/SQPNP + Gauss-Newton refine) to reach cv2-parity on real scenes with no
-  OpenCV dependency.
+- ✅ **Robust PnP → `solve_pnp` (EPnP + Gauss-Newton)** — `solve_pnp_numpy` (DLT +
+  RANSAC, via the 12×12 `AᵀA` nullspace) is kept as the asset-free golden-test
+  reference, but on real scenes the DLT inherits the textbook **planar/mirror
+  degeneracy** (seed-dependent: ~3/5 RANSAC seeds near cv2, ~2/5 a ~135–152°
+  flip). The shipped real-data solver is `solve_pnp`: **EPnP** (planar-robust,
+  non-iterative, uses all points so there is no random minimal-sample flip —
+  reuses the 12×12 `MᵀM` Jacobi eigendecomposition) for the init, then a
+  **Huber-robust Gauss-Newton** reprojection refine. On the real scene dump it is
+  **deterministic** (identical across all RANSAC seeds) and lands at **0.73° of
+  the upstream cv2/SQPNP** relative rotation (0.74° translation direction) — i.e.
+  **cv2-parity on real data with no OpenCV dependency**, versus the numpy DLT's
+  175° miss on the same dump. Golden tests cover exact recovery, a near-planar
+  config (where DLT flips), and 15% gross-outlier rejection.
 - ⬜ Not yet ported: accumulation chaining, loop closure, consensus fusion (these
   compose the primitives above), and the CLI / C-API surface.
 

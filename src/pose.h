@@ -70,12 +70,24 @@ LoopError loop_closure_error(const std::vector<Sim3> & links);
 // of the eigendecomposition; valid while rotation < 180deg. Mirrors sim_frac_power.
 Mat4 sim_frac_power(const Mat4 & M, double f);
 
-// ---- PnP (mirrors pose/pnp.py numpy backend) -------------------------------
-// RANSAC DLT PnP with known intrinsics K. Xw is N*3 world points, pixels is N*2
-// (col,row). Returns cam2world (4x4) and fills `inliers` (size N, 0/1).
+// ---- PnP -------------------------------------------------------------------
+// RANSAC DLT PnP with known intrinsics K (mirrors pose/pnp.py numpy backend).
+// Xw is N*3 world points, pixels is N*2 (col,row). Returns cam2world (4x4) and
+// fills `inliers` (size N, 0/1). Kept as the asset-free golden-test reference; on
+// real scenes the DLT inherits the planar/mirror degeneracy — use solve_pnp.
 Mat4 solve_pnp_numpy(const double * Xw, const double * pixels, int N, const Mat3 & K,
                      std::vector<char> & inliers,
                      double thresh_px = 5.0, int iters = 100, uint64_t seed = 0);
+
+// Robust PnP: EPnP (planar-robust, deterministic — uses all points, no random
+// minimal samples) for the initial pose, then a Gauss-Newton / Huber reprojection
+// refine. Reaches cv2/SQPNP-grade poses on real scenes with no OpenCV dependency.
+// Fills `inliers` (reprojection < thresh_px). This is what estimate_poses uses.
+Mat4 solve_pnp(const double * Xw, const double * pixels, int N, const Mat3 & K,
+               std::vector<char> & inliers, double thresh_px = 5.0, int gn_iters = 10);
+
+// EPnP-only (no refine) — exposed for testing the planar-robust initialization.
+Mat4 solve_pnp_epnp(const double * Xw, const double * pixels, int N, const Mat3 & K);
 
 // Integer pixel grid (col,row), row-major over H*W — matches upstream xy_grid
 // (no half-pixel offset). Fills `out` with 2*H*W doubles.
