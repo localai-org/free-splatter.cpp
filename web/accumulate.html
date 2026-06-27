@@ -335,7 +335,7 @@ async function loadStep(i){
     if(!resp.ok) throw new Error("HTTP "+resp.status+" for "+step.splat);
     const bytes = new Uint8Array(await resp.arrayBuffer());
     setSplat(bytes);
-    if(!framed) frameToData(1.25);                   // frame once; camera stays as it grows
+    if(!framed) frameToData(0.9);                    // frame once; camera stays as it grows
     if (step.label) {
       banner.innerHTML = `<b>✓ ${step.label}</b> · ${count.toLocaleString()} splats`;
       setStatus(`${step.label} · ${count.toLocaleString()} splats`);

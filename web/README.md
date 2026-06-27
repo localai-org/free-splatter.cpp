@@ -43,8 +43,15 @@ python3 -m http.server -d .cache/demo/accumulate 8080   # open http://localhost:
 
 URL params: `?ms=2600` step interval, `?start=N` begin at step N, `?auto=0` no
 auto-advance, `?spin=0` no auto-orbit. The cloud shown is the raw accumulated
-cloud; `--fuse` also writes a consensus-fused `acc_fused.splat` (the edge-haze
-floaters removed).
+cloud; the bake also writes a consensus-fused `acc_fused.splat` (the edge-haze
+floaters removed), shown as a final step.
+
+**Pick frames with lateral baseline.** Two-view depth needs the camera to
+*translate sideways* — a pure forward dolly (the camera moving along the direction
+it faces) gives near-zero parallax and reconstructs blurry. Frames a few apart
+from an orbiting / strafing clip work far better than tightly-spaced frames of a
+walk-forward clip. Rule of thumb: the per-pair lateral baseline should be a few %
+of scene depth or more (`scripts/` had a `baseline` probe in git history).
 
 ## Sanity-checking the data separately
 
