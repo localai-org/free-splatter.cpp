@@ -426,6 +426,158 @@ static void test_pnp_robust_outliers() {
     check("outliers rejected", rejected > 0.85 * n_out);
 }
 
+// ===========================================================================
+// Accumulation / fusion / loop closure (the orchestration on top of the
+// primitives, mirrors accumulate.py / fuse.py / loop_closure.py)
+// ===========================================================================
+
+// Synthetic multi-frame clip with KNOWN geometry: a pinhole camera on a smooth
+// trajectory; each pair's gaussians are exact back-projections (engine channel
+// layout), and consecutive runs are rescaled by a distinct per-run factor (the
+// 1/baseline normalization that makes cross-run alignment a *similarity*). The
+// accumulator must recover the camera trajectory (up to a global Sim(3)) and the
+// per-link scale ratios.
+static Mat4 cam2world_frame(int i) {
+    const double ang = i * 4.0 * M_PI / 180.0;                 // small yaw per frame
+    const double c = std::cos(ang), s = std::sin(ang);
+    Mat4 M = fsla::mat4_identity();
+    M(0,0)=c; M(0,2)=s; M(2,0)=-s; M(2,2)=c;
+    M(0,3) = i * 0.4;                                          // translate along x
+    return M;
+}
+static double depth_at(int i, int r, int c) {
+    return 5.0 + 0.3*std::sin(0.7*i) + 0.05*r - 0.03*c
+         + 0.4 * (((r*7 + c*13 + i*5) % 11) / 11.0);           // non-coplanar spread
+}
+
+static void test_accumulate_chain() {
+    std::printf("test_accumulate_chain\n");
+    const int H = 16, W = 16, gc = 23, P = H*W, F = 5;        // 5 frames -> 4 pairs
+    const double f = 18.0;
+    Mat3 K = make_K(f, W, H), Kinv = fsla::inv3(K);
+    auto backproj = [&](int i, int r, int c) -> Vec3 {
+        const double d = depth_at(i, r, c);
+        Vec3 uv = { (double) c, (double) r, 1.0 };
+        Vec3 n = fsla::mat3_apply(Kinv, uv);
+        return { n[0]*d, n[1]*d, n[2]*d };
+    };
+
+    Accumulator acc(H, W, /*opacity_threshold=*/0.05);
+    std::vector<double> sigma(F);
+    for (int k = 0; k < F-1; k++) {                           // pair (k, k+1) -> run k
+        const double sk = 1.0 + 0.1*k;                        // distinct per-run scale
+        sigma[k] = sk;
+        Mat4 w2c_k = fsla::inv_rigid4(cam2world_frame(k));
+        Mat4 rel = fsla::mat4_mul(w2c_k, cam2world_frame(k+1));   // cam_k <- cam_{k+1}
+        std::vector<float> buf((size_t) 2 * P * gc, 0.0f);
+        for (int r = 0; r < H; r++) for (int c = 0; c < W; c++) {
+            const int i = r*W + c;
+            Vec3 X0 = backproj(k, r, c);                      // camera-k frame
+            Vec3 Xn = backproj(k+1, r, c);                    // camera-(k+1) frame
+            Vec3 X1 = apply_mat4(rel, Xn);                    // -> camera-k frame
+            float * v0 = &buf[(size_t) i * gc];
+            float * v1 = &buf[(size_t) (P + i) * gc];
+            for (int t = 0; t < 3; t++) { v0[t] = (float)(sk*X0[t]); v1[t] = (float)(sk*X1[t]); }
+            v0[15] = v1[15] = 0.9f;                           // opacity (activated)
+            for (int t = 0; t < 3; t++) { v0[3+t] = 0.1f*t; v1[3+t] = 0.1f*t; } // color
+        }
+        acc.add_pair(buf.data(), gc);
+    }
+
+    check("pair count", acc.pair_count() == F-1);
+    check("frame count", acc.frame_count() == F);
+    check("cloud non-empty", acc.cloud().size() == (size_t) F * P);   // all opacities valid
+
+    // per-link scale recovers sigma_{k-1}/sigma_k
+    bool scales_ok = true; double worst_scale = 0;
+    for (int k = 1; k < F-1; k++) {
+        const double expect = sigma[k-1]/sigma[k];
+        worst_scale = std::max(worst_scale, std::fabs(acc.links()[k].scale - expect));
+        scales_ok &= std::fabs(acc.links()[k].scale - expect) < 1e-6;
+    }
+    { char buf[64]; std::snprintf(buf, sizeof buf, "worst |Δs| %.2e", worst_scale);
+      check("per-link scale recovered", scales_ok, buf); }
+    double worst_resid = 0;
+    for (int k = 1; k < F-1; k++) worst_resid = std::max(worst_resid, acc.links()[k].resid_frac);
+    { char buf[64]; std::snprintf(buf, sizeof buf, "%.2e", worst_resid);
+      check("per-link residual ~0", worst_resid < 1e-6, buf); }
+
+    // recovered trajectory vs GT, after a global Sim(3) alignment (ATE)
+    std::vector<Mat4> path = acc.camera_path();
+    std::vector<double> rec(3*F), gt(3*F);
+    for (int i = 0; i < F; i++) {
+        rec[3*i]=path[i](0,3); rec[3*i+1]=path[i](1,3); rec[3*i+2]=path[i](2,3);
+        Mat4 g = cam2world_frame(i);
+        gt[3*i]=g(0,3); gt[3*i+1]=g(1,3); gt[3*i+2]=g(2,3);
+    }
+    Sim3 A = fit_similarity(rec.data(), gt.data(), F);
+    std::vector<double> rec_al(3*F);
+    apply_sim_arr(A.s, A.R, A.t, rec.data(), F, rec_al.data());
+    double mg[3]={0,0,0}; for (int i=0;i<F;i++) for(int c=0;c<3;c++) mg[c]+=gt[3*i+c];
+    for (int c=0;c<3;c++) mg[c]/=F;
+    double ext=0; for(int i=0;i<F;i++) for(int c=0;c<3;c++){double d=gt[3*i+c]-mg[c]; ext+=d*d;}
+    ext = std::sqrt(ext/F);
+    const double ate = rms3(rec_al.data(), gt.data(), F) / ext;
+    { char buf[64]; std::snprintf(buf, sizeof buf, "ATE %.2e of extent", ate);
+      check("trajectory recovered", ate < 1e-3, buf); }
+}
+
+static void test_consensus_fuse() {
+    std::printf("test_consensus_fuse\n");
+    std::vector<AccumPoint> cloud;
+    // 5 surface points, each corroborated by frames {0,1,2} (tight cluster -> one
+    // voxel, support 3); 20 isolated single-frame floaters far apart (support 1).
+    for (int loc = 0; loc < 5; loc++)
+        for (int fr = 0; fr < 3; fr++)
+            cloud.push_back({ (float)(2.0*loc) + 0.001f*fr, 0.0f, 0.0f, 0.5f, 0.5f, 0.5f, fr });
+    for (int j = 0; j < 20; j++)
+        cloud.push_back({ 40.0f + 2.0f*j, 0.0f, 0.0f, 0.2f, 0.2f, 0.2f, j % 4 });
+
+    std::vector<AccumPoint> fused;
+    FuseStats st = consensus_fuse(cloud, /*voxel_frac=*/0.02, /*k=*/2, fused);
+    check("raw points", st.raw_points == 35);
+    check("kept voxels (the surface)", st.kept_voxels == 5);
+    check("fused size", fused.size() == 5);
+    check("points kept", st.points_kept == 15);
+    check("floaters dropped", st.points_dropped == 20);
+    // a fused point sits at its cluster centroid (~2*loc), color preserved
+    bool centroid_ok = true;
+    for (const auto & p : fused) {
+        const double loc = std::round(p.x / 2.0);
+        centroid_ok &= std::fabs(p.x - 2.0*loc) < 0.01 && std::fabs(p.r - 0.5) < 1e-6;
+    }
+    check("fused centroid + color", centroid_ok);
+}
+
+static void test_loop_distribute() {
+    std::printf("test_loop_distribute\n");
+    Mat3 R = rand_rotation();
+    Mat4 D = sim_matrix({ 1.15, R, {0.4, -0.2, 0.1} });
+    // sim4_invert is a true inverse of a similarity 4x4
+    Mat4 S = sim_matrix({ 1.3, rand_rotation(), {1.0, -2.0, 0.5} });
+    Mat4 SI = fsla::mat4_mul(sim4_invert(S), S);
+    bool inv_ok = true; for (int i = 0; i < 16; i++) inv_ok &= std::fabs(SI.a[i] - fsla::mat4_identity().a[i]) < 1e-9;
+    check("sim4_invert is an inverse", inv_ok);
+
+    // a clean loop, drifted by D^{-k/n}; distribute_drift(D) must cancel it.
+    const int n = 8;
+    std::vector<Mat4> poses(n+1);
+    std::vector<Vec3> clean(n+1);
+    for (int k = 0; k <= n; k++) {
+        const double tt = 2*M_PI * k / n;
+        clean[k] = { std::cos(tt), std::sin(tt), 0.1*tt };
+        Vec3 drifted = apply_mat4(sim_frac_power(D, -(double)k/n), clean[k]);
+        Mat4 Pk = fsla::mat4_identity();
+        Pk(0,3)=drifted[0]; Pk(1,3)=drifted[1]; Pk(2,3)=drifted[2];
+        poses[k] = Pk;
+    }
+    std::vector<Vec3> corr = distribute_drift(D, poses);
+    double post = 0;
+    for (int k = 0; k <= n; k++) for (int c = 0; c < 3; c++) post += (corr[k][c]-clean[k][c])*(corr[k][c]-clean[k][c]);
+    char buf[64]; std::snprintf(buf, sizeof buf, "ATE %.1e", std::sqrt(post/(n+1)));
+    check("distribute_drift recovers clean loop", std::sqrt(post/(n+1)) < 1e-9, buf);
+}
+
 int main() {
     test_similarity_roundtrip();
     test_scale_detection();
@@ -439,6 +591,9 @@ int main() {
     test_pnp_robust_recovery();
     test_pnp_robust_planar();
     test_pnp_robust_outliers();
+    test_accumulate_chain();
+    test_consensus_fuse();
+    test_loop_distribute();
     std::printf(failures ? "\ntest_pose: %d FAILURES\n" : "\ntest_pose: ok\n", failures);
     return failures ? 1 : 0;
 }

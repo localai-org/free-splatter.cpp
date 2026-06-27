@@ -110,6 +110,87 @@ PoseResult estimate_poses(const std::vector<const float *> & points,
                           double focal = -1.0, int pnp_iter = 100,
                           bool normalize = false, uint64_t seed = 0);
 
+// ---- accumulation: chain successive runs into one world (mirrors accumulate.py)
+// One accumulated point in the global frame, tagged with the source frame it came
+// from (consensus fusion needs the frame id). rgb is in [0,1].
+struct AccumPoint {
+    float x, y, z;
+    float r, g, b;
+    int32_t frame;
+};
+
+// Diagnostics for chaining one run into the global frame.
+struct ChainLink {
+    Sim3   sim;          // run k -> run k-1 (local similarity); identity for run 0
+    Sim3   global;       // run k -> global frame (T_k = T_{k-1} . sim)
+    double scale;        // sim.s — per-link scale drift
+    double inlier_frac;  // RANSAC inliers / shared-frame valid points
+    double valid_frac;   // pixels valid (opacity) in BOTH shared views
+    double resid_frac;   // inlier RANSAC residual / target scene extent
+};
+
+// Sliding-window accumulator: feed it each consecutive pair's engine output
+// ([2,H,W,gc], where view 0 shares a frame with the previous pair's view 1) and
+// it recovers each pair's cameras (estimate_poses), fits the cross-run Sim(3) on
+// the shared frame, composes a global chain, and drops every new frame's gaussians
+// into one world. This is the live accumulating-reconstruction loop, in C++.
+class Accumulator {
+public:
+    Accumulator(int H, int W, double opacity_threshold = 0.05,
+                double ransac_thresh_frac = 0.02, int ransac_iters = 300,
+                uint64_t seed = 0);
+
+    // gaussians: 2*H*W*gc floats (two views, engine channel layout). Recovers the
+    // pair's cameras, chains the Sim(3), accumulates the new frame(s). focal<=0 ->
+    // estimate per pair (use_first_focal). Returns the chain link just added.
+    ChainLink add_pair(const float * gaussians, int gaussian_channels, double focal = -1.0);
+
+    const std::vector<AccumPoint> & cloud() const { return cloud_; }
+    const std::vector<ChainLink>  & links() const { return links_; }
+    // count+1 global cam2world (similarity) matrices: frame f_k = T_k . c2w_k[view0],
+    // plus the final frame f_n = T_{n-1} . c2w_{n-1}[view1]. Mirrors accumulate.py's `rec`.
+    std::vector<Mat4> camera_path() const;
+    int  frame_count() const { return next_frame_; }
+    int  pair_count()  const { return (int) links_.size(); }
+    const Sim3 & global_transform() const { return T_; }
+
+private:
+    void add_view(const float * pts, const float * op, const float * rgb,
+                  const Sim3 & T, int frame);
+
+    int H_, W_;
+    double thr_, rthr_;
+    int riters_;
+    uint64_t seed_;
+    Sim3 T_;
+    bool have_prev_ = false;
+    std::vector<float> prev_pts1_;   // 3*P previous view-1 points (the shared frame)
+    std::vector<char>  prev_mask1_;  // P   previous view-1 opacity mask
+    std::vector<AccumPoint> cloud_;
+    std::vector<Mat4>       cams_;       // per-pair view-0 global cam2world
+    Mat4                    final_cam_;  // latest view-1 global cam2world (appended last)
+    std::vector<ChainLink>  links_;
+    int next_frame_ = 0;
+};
+
+// ---- consensus fusion (mirrors fuse.py) -----------------------------------
+struct FuseStats {
+    int64_t raw_points, voxels, kept_voxels, points_kept, points_dropped;
+};
+// Voxelize the cloud at voxel_frac * cloud-extent and keep only voxels corroborated
+// by >= k DISTINCT source frames, averaging the agreeing predictions (which also
+// denoises the surface). `fused` receives one averaged point per consensus voxel.
+FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_frac, int k,
+                         std::vector<AccumPoint> & fused);
+
+// ---- loop closure (mirrors loop_closure.py) -------------------------------
+// Inverse of a similarity 4x4 [[sR,t],[0,1]] (sR = s*rotation): [[(1/s)Rᵀ,...],[0,1]].
+Mat4 sim4_invert(const Mat4 & M);
+// Distribute an accumulated Sim(3) drift D over a chain of n+1 nodes by applying
+// D^(k/n) at node k (even relaxation, sim_frac_power). Returns the corrected camera
+// centers. global_poses are the open-loop global cam2world (similarity) matrices.
+std::vector<Vec3> distribute_drift(const Mat4 & D, const std::vector<Mat4> & global_poses);
+
 } // namespace pose
 } // namespace free_splatter
 
