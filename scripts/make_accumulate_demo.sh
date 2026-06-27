@@ -29,21 +29,24 @@ for i in "${!FRAMES[@]}"; do
 done
 
 # 2) accumulate: one engine pass over the stream writes acc_2.splat, acc_3.splat,
-#    ... (the cloud after each photo is folded in).
-"$CLI" --device "$DEVICE" --accumulate --splat-prefix "$OUT/acc" \
+#    ... (the cloud after each photo is folded in) + acc_fused.splat (the
+#    consensus surface: voxels seen by >= K frames, single-view floaters removed).
+"$CLI" --device "$DEVICE" --accumulate --fuse --splat-prefix "$OUT/acc" \
   --max-splats "$MAXSPLATS" "$MODEL" "${FRAMES[@]}"
 
-# 3) manifest.json: one step per added photo (acc_n.splat + the n thumbnails,
-#    the last being the one just added).
+# 3) manifest.json: one step per added photo (acc_n.splat + the n thumbnails, the
+#    last being the one just added), then a final consensus-fused step.
 n=${#FRAMES[@]}
+allimgs=""
+for ((j=0;j<n;j++)); do allimgs+="\"view_$j.jpg\""; [ $j -lt $((n-1)) ] && allimgs+=", "; done
 {
   echo '{ "steps": ['
   for ((k=2;k<=n;k++)); do
     imgs=""
     for ((j=0;j<k;j++)); do imgs+="\"view_$j.jpg\""; [ $j -lt $((k-1)) ] && imgs+=", "; done
-    printf '    {"splat":"acc_%d.splat","images":[%s],"n":%d}' "$k" "$imgs" "$k"
-    [ $k -lt $n ] && echo "," || echo ""
+    printf '    {"splat":"acc_%d.splat","images":[%s],"n":%d},\n' "$k" "$imgs" "$k"
   done
+  printf '    {"splat":"acc_fused.splat","images":[%s],"n":%d,"label":"consensus-fused — single-view floaters removed"}\n' "$allimgs" "$n"
   echo '  ] }'
 } > "$OUT/manifest.json"
 
