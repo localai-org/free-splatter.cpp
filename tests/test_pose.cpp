@@ -337,6 +337,95 @@ static void test_pnp_outliers() {
     check("outliers rejected", rejected > 0.85 * n_out);
 }
 
+// ===========================================================================
+// Robust PnP: EPnP + Gauss-Newton (the shipped real-data solver)
+// ===========================================================================
+
+static void test_pnp_robust_recovery() {
+    std::printf("test_pnp_robust_recovery\n");
+    const int N = 500; Mat3 K = make_K(400, 512, 512);
+    std::uniform_real_distribution<double> ux(-2,2), uy(-2,2), uz(4,8);
+    std::vector<double> Pw(3*N);
+    for (int i = 0; i < N; i++) { Pw[3*i]=ux(RNG); Pw[3*i+1]=uy(RNG); Pw[3*i+2]=uz(RNG); }
+    std::normal_distribution<double> g(0, 1);
+    std::uniform_real_distribution<double> ut(-0.6, 0.6);
+    double worst_R = 0, worst_t = 0;
+    for (int trial = 0; trial < 8; trial++) {
+        Mat3 R = rand_rotation();
+        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) R(i,j) = (i==j?1.0:0.0)*0.8 + R(i,j)*0.2;
+        { fsla::Mat3 U,V; Vec3 s; fsla::svd3(R,U,s,V); R = mul(U,T(V)); if (fsla::det3(R)<0) for(int i=0;i<3;i++) R(i,2)=-R(i,2); }
+        Vec3 t = { ut(RNG), ut(RNG), ut(RNG) };
+        std::vector<double> px(2*N), z(N);
+        project(Pw.data(), N, R, t, K, px.data(), z.data());
+        bool behind = false; for (int i = 0; i < N; i++) if (z[i] <= 0) behind = true;
+        if (behind) continue;
+        std::vector<char> inl;
+        Mat4 c2w = solve_pnp(Pw.data(), px.data(), N, K, inl);
+        Mat4 w2c = fsla::inv_rigid4(c2w);
+        Mat3 Rr{}; Vec3 tr{};
+        for (int i = 0; i < 3; i++) { for (int j = 0; j < 3; j++) Rr(i,j)=w2c(i,j); tr[i]=w2c(i,3); }
+        worst_R = std::max(worst_R, (double) rot_angle(mul(Rr, T(R))));
+        worst_t = std::max(worst_t, std::sqrt((tr[0]-t[0])*(tr[0]-t[0])+(tr[1]-t[1])*(tr[1]-t[1])+(tr[2]-t[2])*(tr[2]-t[2])));
+    }
+    char buf[64]; std::snprintf(buf, sizeof buf, "worst %.2e deg", worst_R);
+    check("rotation recovered", worst_R < 1e-3, buf);
+    check("translation recovered", worst_t < 1e-5);
+}
+
+static void test_pnp_robust_planar() {
+    // Near-planar scene (a thin slab) — the config where the DLT's coplanar
+    // minimal samples flip. EPnP's all-point control basis stays well-posed.
+    std::printf("test_pnp_robust_planar\n");
+    const int N = 500; Mat3 K = make_K(400, 512, 512);
+    std::uniform_real_distribution<double> ux(-2,2), uy(-2,2);
+    std::normal_distribution<double> thin(0, 0.02);              // ~planar, slight thickness
+    std::vector<double> Pw(3*N);
+    for (int i = 0; i < N; i++) { Pw[3*i]=ux(RNG); Pw[3*i+1]=uy(RNG); Pw[3*i+2]=6.0 + thin(RNG); }
+    Mat3 R = rand_rotation();
+    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) R(i,j) = (i==j?1.0:0.0)*0.85 + R(i,j)*0.15;
+    { fsla::Mat3 U,V; Vec3 s; fsla::svd3(R,U,s,V); R = mul(U,T(V)); if (fsla::det3(R)<0) for(int i=0;i<3;i++) R(i,2)=-R(i,2); }
+    Vec3 t = { 0.2, -0.1, 0.3 };
+    std::vector<double> px(2*N), z(N);
+    project(Pw.data(), N, R, t, K, px.data(), z.data());
+    std::vector<char> inl;
+    Mat4 w2c = fsla::inv_rigid4(solve_pnp(Pw.data(), px.data(), N, K, inl));
+    Mat3 Rr{}; Vec3 tr{};
+    for (int i = 0; i < 3; i++) { for (int j = 0; j < 3; j++) Rr(i,j)=w2c(i,j); tr[i]=w2c(i,3); }
+    char buf[64]; std::snprintf(buf, sizeof buf, "%.4f deg", (double) rot_angle(mul(Rr, T(R))));
+    check("planar rotation recovered", rot_angle(mul(Rr, T(R))) < 0.05, buf);
+    check("planar translation recovered", std::sqrt((tr[0]-t[0])*(tr[0]-t[0])+(tr[1]-t[1])*(tr[1]-t[1])+(tr[2]-t[2])*(tr[2]-t[2])) < 0.01);
+}
+
+static void test_pnp_robust_outliers() {
+    std::printf("test_pnp_robust_outliers\n");
+    const int N = 600; Mat3 K = make_K(400, 512, 512);
+    std::uniform_real_distribution<double> ux(-2,2), uy(-2,2), uz(4,8);
+    std::vector<double> Pw(3*N);
+    for (int i = 0; i < N; i++) { Pw[3*i]=ux(RNG); Pw[3*i+1]=uy(RNG); Pw[3*i+2]=uz(RNG); }
+    Mat3 R = rand_rotation();
+    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) R(i,j) = (i==j?1.0:0.0)*0.85 + R(i,j)*0.15;
+    { fsla::Mat3 U,V; Vec3 s; fsla::svd3(R,U,s,V); R = mul(U,T(V)); if (fsla::det3(R)<0) for(int i=0;i<3;i++) R(i,2)=-R(i,2); }
+    Vec3 t = { 0.3, -0.2, 0.4 };
+    std::vector<double> px(2*N), z(N);
+    project(Pw.data(), N, R, t, K, px.data(), z.data());
+    std::vector<double> Pk, pk;
+    for (int i = 0; i < N; i++) if (z[i] > 0) { for(int c=0;c<3;c++) Pk.push_back(Pw[3*i+c]); pk.push_back(px[2*i]); pk.push_back(px[2*i+1]); }
+    const int M = (int) pk.size()/2;
+    const int n_out = (int)(0.15 * M);                          // 15% gross pixel corruption
+    std::vector<int> oidx(M); for (int i = 0; i < M; i++) oidx[i]=i;
+    std::shuffle(oidx.begin(), oidx.end(), RNG);
+    std::uniform_real_distribution<double> corrupt(-120, 120);
+    for (int k = 0; k < n_out; k++) { int i = oidx[k]; pk[2*i]+=corrupt(RNG); pk[2*i+1]+=corrupt(RNG); }
+    std::vector<char> inl;
+    Mat4 w2c = fsla::inv_rigid4(solve_pnp(Pk.data(), pk.data(), M, K, inl, 3.0));
+    Mat3 Rr{}; Vec3 tr{};
+    for (int i = 0; i < 3; i++) { for (int j = 0; j < 3; j++) Rr(i,j)=w2c(i,j); tr[i]=w2c(i,3); }
+    char buf[64]; std::snprintf(buf, sizeof buf, "%.3f deg", (double) rot_angle(mul(Rr, T(R))));
+    check("rotation under outliers", rot_angle(mul(Rr, T(R))) < 0.5, buf);
+    int rejected = 0; for (int k = 0; k < n_out; k++) if (!inl[oidx[k]]) rejected++;
+    check("outliers rejected", rejected > 0.85 * n_out);
+}
+
 int main() {
     test_similarity_roundtrip();
     test_scale_detection();
@@ -347,6 +436,9 @@ int main() {
     test_focal_recovery();
     test_pnp_recovery();
     test_pnp_outliers();
+    test_pnp_robust_recovery();
+    test_pnp_robust_planar();
+    test_pnp_robust_outliers();
     std::printf(failures ? "\ntest_pose: %d FAILURES\n" : "\ntest_pose: ok\n", failures);
     return failures ? 1 : 0;
 }

@@ -6,6 +6,7 @@
 // self-contained Jacobi eigensolver in linalg.h — no Eigen, no OpenCV.
 #include "pose.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -504,12 +505,286 @@ Mat4 solve_pnp_numpy(const double * Xw, const double * pixels, int N, const Mat3
     return inv_rigid4(world2cam);
 }
 
+// ---- robust PnP: EPnP + Gauss-Newton --------------------------------------
+//
+// EPnP (Lepetit/Moreno-Noguer/Fua 2009): express each world point as a
+// barycentric combination of 4 control points; the camera-frame control points
+// live in the null space of a 2n x 12 system, recovered from the eigenvectors of
+// the 12x12 MᵀM (the same Jacobi eigensolver as everywhere else). It is
+// non-iterative, uses ALL points (no random minimal samples), and handles
+// near-planar configs — so it does not suffer the DLT's seed-dependent mirror
+// flips. We try N=1,2,3 null vectors, pick the lowest reprojection error, then
+// polish (R,t) with a Huber-robust Gauss-Newton on the reprojection residual.
+
+namespace {
+
+Mat3 skew_neg(const Vec3 & x) {     // -[x]_×  = ∂Xc/∂ω for left perturbation
+    return Mat3{ { 0,  x[2], -x[1],
+                  -x[2], 0,  x[0],
+                   x[1], -x[0], 0 } };
+}
+
+Mat3 so3_exp(const Vec3 & w) {      // rotation from an axis-angle (rotation vector)
+    const double th = std::sqrt(w[0]*w[0] + w[1]*w[1] + w[2]*w[2]);
+    if (th < 1e-12) {               // I + [w]_× to first order
+        Mat3 R = mat3_identity();
+        R(0,1) = -w[2]; R(0,2) = w[1]; R(1,0) = w[2]; R(1,2) = -w[0]; R(2,0) = -w[1]; R(2,1) = w[0];
+        return R;
+    }
+    return rodrigues({ w[0]/th, w[1]/th, w[2]/th }, th);
+}
+
+double reproj_rms(const double * Xw, const double * px, int N, const Mat3 & K,
+                  const Mat3 & R, const Vec3 & t) {
+    const double fu = K(0,0), fv = K(1,1), cu = K(0,2), cv = K(1,2);
+    double s = 0; int m = 0;
+    for (int i = 0; i < N; i++) {
+        Vec3 p = { Xw[3*i], Xw[3*i+1], Xw[3*i+2] };
+        Vec3 Xc = mat3_apply(R, p); Xc[0]+=t[0]; Xc[1]+=t[1]; Xc[2]+=t[2];
+        if (Xc[2] <= 1e-6) { s += 1e6; m++; continue; }
+        const double dx = fu*Xc[0]/Xc[2] + cu - px[2*i];
+        const double dy = fv*Xc[1]/Xc[2] + cv - px[2*i+1];
+        s += dx*dx + dy*dy; m++;
+    }
+    return std::sqrt(s / std::max(m, 1));
+}
+
+// Recover camera-frame control points from the null-space vector x (12), fix the
+// global sign by cheirality (scene in front), and get world2cam (R,t) from the
+// rigid fit between the 4 world and 4 camera control points.
+void recover_Rt(const double * x12, const double cw[4][3], const double * alpha, int N,
+                Mat3 & R, Vec3 & t) {
+    double cc[12];
+    for (int i = 0; i < 12; i++) cc[i] = x12[i];
+    // mean camera-frame depth over the points (pc = sum_j alpha_ij cc_j)
+    double meanz = 0;
+    for (int i = 0; i < N; i++) {
+        double z = 0;
+        for (int j = 0; j < 4; j++) z += alpha[4*i+j] * cc[3*j+2];
+        meanz += z;
+    }
+    if (meanz < 0) for (int i = 0; i < 12; i++) cc[i] = -cc[i];
+    double cwf[12];
+    for (int j = 0; j < 4; j++) for (int k = 0; k < 3; k++) cwf[3*j+k] = cw[j][k];
+    Sim3 T = fit_similarity(cwf, cc, 4, /*with_scale=*/false);     // rigid world->camera
+    R = T.R; t = T.t;
+}
+
+// EPnP core: returns the best (R,t) world2cam over N=1,2,3 by reprojection error.
+void epnp(const double * Xw, const double * px, int N, const Mat3 & K, Mat3 & Rout, Vec3 & tout) {
+    // 1. control points: centroid + principal axes (sqrt-eigenvalue scaled).
+    double c0[3] = {0,0,0};
+    for (int i = 0; i < N; i++) { c0[0]+=Xw[3*i]; c0[1]+=Xw[3*i+1]; c0[2]+=Xw[3*i+2]; }
+    c0[0]/=N; c0[1]/=N; c0[2]/=N;
+    double Cov[9] = {0};
+    for (int i = 0; i < N; i++) {
+        const double d[3] = { Xw[3*i]-c0[0], Xw[3*i+1]-c0[1], Xw[3*i+2]-c0[2] };
+        for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) Cov[r*3+c] += d[r]*d[c];
+    }
+    for (int i = 0; i < 9; i++) Cov[i] /= N;
+    double ev[3], evec[9];
+    fsla::jacobi_eigh(Cov, 3, ev, evec);
+    double lam_max = std::max({ev[0], ev[1], ev[2], 1e-12});
+    double cw[4][3];
+    for (int k = 0; k < 3; k++) cw[0][k] = c0[k];
+    for (int j = 0; j < 3; j++) {
+        // floor the axis length so a near-planar scene keeps 4 affinely-independent
+        // control points (an invertible barycentric matrix).
+        const double s = std::sqrt(std::max(ev[j], 1e-6 * lam_max));
+        for (int k = 0; k < 3; k++) cw[j+1][k] = c0[k] + s * evec[k*3 + j];
+    }
+
+    // 2. barycentric coordinates: alpha_i = C^{-1} [p_i; 1], C = [[cw^T];[1...]].
+    double C[16];
+    for (int j = 0; j < 4; j++) { for (int k = 0; k < 3; k++) C[k*4+j] = cw[j][k]; C[3*4+j] = 1.0; }
+    double Cinv[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    solve_lin(C, 4, Cinv, 4);                       // Cinv now holds C^{-1}
+    std::vector<double> alpha((size_t) 4 * N);
+    for (int i = 0; i < N; i++) {
+        const double p[4] = { Xw[3*i], Xw[3*i+1], Xw[3*i+2], 1.0 };
+        for (int j = 0; j < 4; j++) {
+            double a = 0; for (int k = 0; k < 4; k++) a += Cinv[j*4+k]*p[k];
+            alpha[4*i+j] = a;
+        }
+    }
+
+    // 3. M (2n x 12) -> MtM (12 x 12).
+    const double fu = K(0,0), fv = K(1,1), cu = K(0,2), cv = K(1,2);
+    double MtM[144] = {0};
+    for (int i = 0; i < N; i++) {
+        double r1[12] = {0}, r2[12] = {0};
+        const double uu = px[2*i], vv = px[2*i+1];
+        for (int j = 0; j < 4; j++) {
+            const double a = alpha[4*i+j];
+            r1[3*j+0] = a*fu; r1[3*j+2] = a*(cu - uu);
+            r2[3*j+1] = a*fv; r2[3*j+2] = a*(cv - vv);
+        }
+        for (int r = 0; r < 12; r++) for (int c = 0; c < 12; c++) MtM[r*12+c] += r1[r]*r1[c] + r2[r]*r2[c];
+    }
+    double mev[12], mevec[144];
+    fsla::jacobi_eigh(MtM, 12, mev, mevec);
+    int ord[12]; for (int i = 0; i < 12; i++) ord[i] = i;
+    std::sort(ord, ord + 12, [&](int a, int b){ return mev[a] < mev[b]; });
+    double V[3][12];                                // the 3 smallest-eigenvalue vectors
+    for (int n = 0; n < 3; n++) for (int i = 0; i < 12; i++) V[n][i] = mevec[i*12 + ord[n]];
+
+    // control-point pairs and their world distances
+    const int pr[6][2] = {{0,1},{0,2},{0,3},{1,2},{1,3},{2,3}};
+    double dw2[6];
+    for (int p = 0; p < 6; p++) {
+        const int i = pr[p][0], j = pr[p][1];
+        double d = 0; for (int k = 0; k < 3; k++) { const double e = cw[i][k]-cw[j][k]; d += e*e; }
+        dw2[p] = d;
+    }
+    auto blkdiff = [&](int n, int p, double out[3]) {
+        const int i = pr[p][0], j = pr[p][1];
+        for (int k = 0; k < 3; k++) out[k] = V[n][3*i+k] - V[n][3*j+k];
+    };
+    auto dot3 = [](const double a[3], const double b[3]){ return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; };
+
+    Mat3 bestR{}; Vec3 bestT{}; double best_err = 1e300; bool have = false;
+    auto consider = [&](const double x12[12]) {
+        Mat3 R; Vec3 t;
+        recover_Rt(x12, cw, alpha.data(), N, R, t);
+        const double e = reproj_rms(Xw, px, N, K, R, t);
+        if (e < best_err) { best_err = e; bestR = R; bestT = t; have = true; }
+    };
+
+    // N=1: x = beta * v0, beta from the 6 distance constraints (least squares).
+    {
+        double num = 0, den = 0;
+        for (int p = 0; p < 6; p++) { double d0[3]; blkdiff(0,p,d0);
+            const double nd = std::sqrt(dot3(d0,d0)); num += nd*std::sqrt(dw2[p]); den += nd*nd; }
+        const double beta = (den > 0) ? num/den : 0.0;
+        double x[12]; for (int i = 0; i < 12; i++) x[i] = beta*V[0][i];
+        consider(x);
+    }
+    // N=2: x = b1 v0 + b2 v1; distance constraints linear in (b1^2,b1b2,b2^2).
+    {
+        double L[18], rho[6];
+        for (int p = 0; p < 6; p++) {
+            double d0[3], d1[3]; blkdiff(0,p,d0); blkdiff(1,p,d1);
+            L[p*3+0] = dot3(d0,d0); L[p*3+1] = 2*dot3(d0,d1); L[p*3+2] = dot3(d1,d1);
+            rho[p] = dw2[p];
+        }
+        double G[9] = {0}, g[3] = {0};               // normal equations (3x3)
+        for (int p = 0; p < 6; p++) { for (int r = 0; r < 3; r++) { for (int c = 0; c < 3; c++) G[r*3+c] += L[p*3+r]*L[p*3+c]; g[r] += L[p*3+r]*rho[p]; } }
+        solve_lin(G, 3, g, 1);                        // g = [b11,b12,b22]
+        const double b1 = std::sqrt(std::fabs(g[0]));
+        double b2 = std::sqrt(std::fabs(g[2]));
+        if (g[1] < 0) b2 = -b2;
+        double x[12]; for (int i = 0; i < 12; i++) x[i] = b1*V[0][i] + b2*V[1][i];
+        consider(x);
+    }
+    // N=3: x = b1 v0 + b2 v1 + b3 v2; 6 constraints in 6 quadratic unknowns.
+    {
+        double L[36], rho[6];
+        for (int p = 0; p < 6; p++) {
+            double d0[3], d1[3], d2[3]; blkdiff(0,p,d0); blkdiff(1,p,d1); blkdiff(2,p,d2);
+            L[p*6+0]=dot3(d0,d0); L[p*6+1]=2*dot3(d0,d1); L[p*6+2]=2*dot3(d0,d2);
+            L[p*6+3]=dot3(d1,d1); L[p*6+4]=2*dot3(d1,d2); L[p*6+5]=dot3(d2,d2);
+            rho[p]=dw2[p];
+        }
+        double Lc[36], rc[6];
+        for (int i = 0; i < 36; i++) Lc[i] = L[i];
+        for (int i = 0; i < 6; i++) rc[i] = rho[i];
+        solve_lin(Lc, 6, rc, 1);                      // rc = [b11,b12,b13,b22,b23,b33]
+        const double b1 = std::sqrt(std::fabs(rc[0]));
+        const double b2 = (b1 > 1e-12) ? rc[1]/b1 : 0.0;
+        const double b3 = (b1 > 1e-12) ? rc[2]/b1 : 0.0;
+        double x[12]; for (int i = 0; i < 12; i++) x[i] = b1*V[0][i] + b2*V[1][i] + b3*V[2][i];
+        consider(x);
+    }
+
+    if (!have) { Rout = mat3_identity(); tout = {0,0,0}; return; }
+    Rout = bestR; tout = bestT;
+}
+
+// Huber-robust Gauss-Newton on the reprojection residual; 6-DoF left perturbation
+// (R <- exp(dw) R, t += dt). Refines an EPnP init to the reprojection minimum and
+// downweights gross outliers, so the deterministic EPnP+GN matches cv2's
+// RANSAC+SQPNP+refine without random sampling.
+void gauss_newton_pnp(const double * Xw, const double * px, int N, const Mat3 & K,
+                      Mat3 & R, Vec3 & t, int iters, double huber_px) {
+    const double fu = K(0,0), fv = K(1,1), cu = K(0,2), cv = K(1,2);
+    for (int it = 0; it < iters; it++) {
+        double H[36] = {0}, b[6] = {0};
+        for (int i = 0; i < N; i++) {
+            Vec3 p = { Xw[3*i], Xw[3*i+1], Xw[3*i+2] };
+            Vec3 Xc = mat3_apply(R, p); Xc[0]+=t[0]; Xc[1]+=t[1]; Xc[2]+=t[2];
+            if (Xc[2] <= 1e-6) continue;
+            const double iz = 1.0/Xc[2];
+            const double rx = fu*Xc[0]*iz + cu - px[2*i];
+            const double ry = fv*Xc[1]*iz + cv - px[2*i+1];
+            const double rn = std::sqrt(rx*rx + ry*ry);
+            const double w = (rn <= huber_px || rn < 1e-12) ? 1.0 : huber_px/rn;
+            // dproj/dXc (2x3)
+            const double Jp[2][3] = { { fu*iz, 0, -fu*Xc[0]*iz*iz },
+                                      { 0, fv*iz, -fv*Xc[1]*iz*iz } };
+            // dXc/d(delta) (3x6) = [ -[Xc]_x | I ]
+            const Mat3 S = skew_neg(Xc);
+            double Jd[3][6];
+            for (int r = 0; r < 3; r++) { Jd[r][0]=S(r,0); Jd[r][1]=S(r,1); Jd[r][2]=S(r,2);
+                                          Jd[r][3]=(r==0); Jd[r][4]=(r==1); Jd[r][5]=(r==2); }
+            double J[2][6];
+            for (int a = 0; a < 2; a++) for (int c = 0; c < 6; c++) {
+                double s = 0; for (int k = 0; k < 3; k++) s += Jp[a][k]*Jd[k][c]; J[a][c] = s; }
+            const double r2[2] = { rx, ry };
+            for (int a = 0; a < 2; a++) {
+                for (int c = 0; c < 6; c++) {
+                    b[c] += w * J[a][c] * r2[a];
+                    for (int d = 0; d < 6; d++) H[c*6+d] += w * J[a][c] * J[a][d];
+                }
+            }
+        }
+        double rhs[6]; for (int i = 0; i < 6; i++) rhs[i] = -b[i];
+        solve_lin(H, 6, rhs, 1);                      // solve H delta = -b
+        Vec3 dw = { rhs[0], rhs[1], rhs[2] };
+        R = mat3_mul(so3_exp(dw), R);
+        t[0]+=rhs[3]; t[1]+=rhs[4]; t[2]+=rhs[5];
+        if (std::fabs(rhs[0])+std::fabs(rhs[1])+std::fabs(rhs[2])+
+            std::fabs(rhs[3])+std::fabs(rhs[4])+std::fabs(rhs[5]) < 1e-12) break;
+    }
+}
+
+} // namespace
+
+Mat4 solve_pnp_epnp(const double * Xw, const double * pixels, int N, const Mat3 & K) {
+    Mat3 R; Vec3 t;
+    epnp(Xw, pixels, N, K, R, t);
+    Mat4 w2c = mat4_identity();
+    for (int i = 0; i < 3; i++) { for (int j = 0; j < 3; j++) w2c(i,j) = R(i,j); w2c(i,3) = t[i]; }
+    return inv_rigid4(w2c);
+}
+
+Mat4 solve_pnp(const double * Xw, const double * pixels, int N, const Mat3 & K,
+               std::vector<char> & inliers, double thresh_px, int gn_iters) {
+    Mat3 R; Vec3 t;
+    epnp(Xw, pixels, N, K, R, t);
+    gauss_newton_pnp(Xw, pixels, N, K, R, t, gn_iters, thresh_px);
+
+    inliers.assign(N, 0);
+    const double fu = K(0,0), fv = K(1,1), cu = K(0,2), cv = K(1,2);
+    for (int i = 0; i < N; i++) {
+        Vec3 p = { Xw[3*i], Xw[3*i+1], Xw[3*i+2] };
+        Vec3 Xc = mat3_apply(R, p); Xc[0]+=t[0]; Xc[1]+=t[1]; Xc[2]+=t[2];
+        if (Xc[2] <= 1e-6) continue;
+        const double dx = fu*Xc[0]/Xc[2] + cu - pixels[2*i];
+        const double dy = fv*Xc[1]/Xc[2] + cv - pixels[2*i+1];
+        if (std::sqrt(dx*dx + dy*dy) < thresh_px) inliers[i] = 1;
+    }
+    Mat4 w2c = mat4_identity();
+    for (int i = 0; i < 3; i++) { for (int j = 0; j < 3; j++) w2c(i,j) = R(i,j); w2c(i,3) = t[i]; }
+    return inv_rigid4(w2c);
+}
+
 // ---- estimate_poses orchestration -----------------------------------------
 
 PoseResult estimate_poses(const std::vector<const float *> & points,
                           const std::vector<const float *> & opacities,
                           int H, int W, double opacity_threshold,
                           double focal, int pnp_iter, bool normalize, uint64_t seed) {
+    (void) pnp_iter; (void) seed;        // robust PnP is deterministic (EPnP+GN)
     const int Nv = (int) points.size();
     const int P = H * W;
     const double ppx = W / 2.0, ppy = H / 2.0;
@@ -547,7 +822,7 @@ PoseResult estimate_poses(const std::vector<const float *> & points,
             px.push_back(grid[2*i]); px.push_back(grid[2*i+1]);
         }
         std::vector<char> inl;
-        Mat4 c2w = solve_pnp_numpy(Xw.data(), px.data(), (int) (Xw.size()/3), K, inl, 5.0, pnp_iter, seed);
+        Mat4 c2w = solve_pnp(Xw.data(), px.data(), (int) (Xw.size()/3), K, inl, 5.0, 10);
         res.cam2world.push_back(c2w);
     }
 
