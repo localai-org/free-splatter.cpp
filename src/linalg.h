@@ -6,8 +6,9 @@
 // C++ with no extra runtime deps beyond ggml) — every routine here reduces to one
 // primitive: a symmetric cyclic-Jacobi eigensolver. SVD of a 3x3 is built as the
 // eigendecomposition of MᵀM; the DLT nullspace is the smallest eigenvector of
-// AᵀA. This mirrors the dependency-free numpy reference solver in pose/pnp.py,
-// which is itself verified bit-for-bit (~1e-7) against cv2 in check_cv2_parity.py.
+// AᵀA. This mirrored the dependency-free numpy reference solver of the (now
+// removed; see git history) pose/ prototype, itself verified bit-for-bit (~1e-7)
+// against cv2.
 //
 // Everything is f64, row-major, and header-only. Sizes are tiny (<=12) so the
 // O(n^3) Jacobi sweeps are negligible next to the engine forward pass.
