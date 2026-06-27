@@ -218,6 +218,14 @@ Sim3 fit_similarity(const double * X, const double * Y, int N, bool with_scale) 
 Sim3 fit_similarity_ransac(const double * X, const double * Y, int N, double thresh,
                            int iters, std::vector<char> & inliers,
                            bool with_scale, uint64_t seed) {
+    // RANSAC's minimal sample is 3 pairs; with fewer there is nothing to sample
+    // (and the sampler would divide by N). Degenerate but valid at the public
+    // boundary (e.g. an image pair with no overlapping valid pixels): take all
+    // points as inliers, and a plain fit when there is at least one.
+    if (N < 3) {
+        inliers.assign(N, 1);
+        return (N >= 1) ? fit_similarity(X, Y, N, with_scale) : sim_identity();
+    }
     Rng rng(seed);
     std::vector<char> best(N, 0);
     int best_cnt = 0;
@@ -962,19 +970,30 @@ FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_fra
     st.raw_points = (int64_t) cloud.size();
     if (cloud.empty()) return st;
 
+    // A non-finite point (NaN/Inf — possible since the cloud is engine output and
+    // this is a public boundary) would poison the extent and, worse, make the
+    // float->int voxel-coord cast UB. Skip them throughout; fuse only finite points.
+    auto finite = [](const AccumPoint & p) {
+        return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z);
+    };
     // extent = rms distance to centroid; voxel = voxel_frac * extent; coords from min.
     double mean[3] = {0,0,0}, lo[3] = {1e300,1e300,1e300};
+    int64_t nf = 0;
     for (const auto & p : cloud) {
+        if (!finite(p)) continue;
         mean[0]+=p.x; mean[1]+=p.y; mean[2]+=p.z;
         lo[0]=std::min(lo[0],(double)p.x); lo[1]=std::min(lo[1],(double)p.y); lo[2]=std::min(lo[2],(double)p.z);
+        nf++;
     }
-    for (int c = 0; c < 3; c++) mean[c] /= cloud.size();
+    if (nf == 0) return st;
+    for (int c = 0; c < 3; c++) mean[c] /= nf;
     double ss = 0;
     for (const auto & p : cloud) {
+        if (!finite(p)) continue;
         const double dx=p.x-mean[0], dy=p.y-mean[1], dz=p.z-mean[2];
         ss += dx*dx + dy*dy + dz*dz;
     }
-    const double ext = std::sqrt(ss / cloud.size());
+    const double ext = std::sqrt(ss / nf);
     const double v = voxel_frac * ext;
     if (!(v > 0)) return st;
 
@@ -988,10 +1007,16 @@ FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_fra
     std::unordered_map<Key, Vox, KeyHash> grid;
     grid.reserve(cloud.size() / 2 + 1);
 
+    auto vcoord = [&](double x, double lov) -> int32_t {
+        const double c = std::floor((x - lov) / v);     // finite (x finite, v>0)
+        // clamp to int32 so an extreme-but-finite coordinate can't overflow the cast
+        if (c < -2147483640.0) return -2147483640;
+        if (c >  2147483640.0) return  2147483640;
+        return (int32_t) c;
+    };
     for (const auto & p : cloud) {
-        Key key{ (int32_t) std::floor((p.x - lo[0]) / v),
-                 (int32_t) std::floor((p.y - lo[1]) / v),
-                 (int32_t) std::floor((p.z - lo[2]) / v) };
+        if (!finite(p)) continue;
+        Key key{ vcoord(p.x, lo[0]), vcoord(p.y, lo[1]), vcoord(p.z, lo[2]) };
         Vox & vx = grid[key];
         vx.sx+=p.x; vx.sy+=p.y; vx.sz+=p.z; vx.sr+=p.r; vx.sg+=p.g; vx.sb+=p.b; vx.cnt++;
         bool seen = false;

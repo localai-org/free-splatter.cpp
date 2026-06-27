@@ -145,12 +145,19 @@ if (FREE_SPLATTER_BUILD_TOOLS AND NOT EMSCRIPTEN)
 endif()
 
 if (FREE_SPLATTER_FUZZ)
-    foreach(target fuzz_image fuzz_options)
+    foreach(target fuzz_image fuzz_options fuzz_pose)
         add_executable(${target} fuzz/${target}.cpp)
         target_link_libraries(${target} PRIVATE free_splatter)
         target_include_directories(${target} PRIVATE src)
         target_link_options(${target} PRIVATE -fsanitize=fuzzer)  # libFuzzer main
     endforeach()
+    # fuzz_decode also drives the vendored (third-party) stb decoder, so it needs
+    # the stb implementation TU + headers (built warning-quiet like the CLI).
+    add_executable(fuzz_decode fuzz/fuzz_decode.cpp tools/stb_impl.cpp)
+    target_link_libraries(fuzz_decode PRIVATE free_splatter)
+    target_include_directories(fuzz_decode PRIVATE src ${CMAKE_SOURCE_DIR}/third_party/stb)
+    target_link_options(fuzz_decode PRIVATE -fsanitize=fuzzer)
+    set_source_files_properties(tools/stb_impl.cpp PROPERTIES COMPILE_OPTIONS "-w")
 endif()
 
 # --- WASM (Emscripten) -------------------------------------------------------
