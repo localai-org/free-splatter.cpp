@@ -13,7 +13,7 @@
 //   POST /api/scene/from-video  multipart "video" + "name" -> {job}  (gated in-process accumulate)
 //   GET  /api/scene/status/{job} -> {state,total,done,kept,scene,error}
 //   GET  /scenes-assets/...    -> a scene's manifest.json + .splat + thumbnails
-//   GET  / , /accumulate.html  -> embedded frontend (reconstruct page + scene viewer)
+//   GET  /                     -> menu; /reconstruct.html, /accumulate.html, /demo.html are the pages
 package main
 
 import (

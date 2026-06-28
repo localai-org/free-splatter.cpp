@@ -9,6 +9,10 @@ This is a thin Go HTTP server that binds the `free_splatter` C API with
 engine — the numerical port, validation, and build details live in the repo root
 `CLAUDE.md`.
 
+One server, one port. `/` is a **menu** linking to the demo pages, all served from
+here: `/reconstruct.html` (photos → splat), `/accumulate.html` (accumulating scenes
++ video upload), `/demo.html` (storyboard).
+
 ## Run
 
 ```sh
