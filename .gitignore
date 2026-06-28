@@ -53,5 +53,6 @@ timeout-*
 /server/fsserver
 /server/server
 
-# Demo-video drop folder (user photos; baked into .cache/demo)
+# Demo drop folders (user photos / videos; baked into .cache/demo)
 /demo-photos/
+/demo-vids/
