@@ -13,8 +13,20 @@ cd "$(dirname "$0")/.."
 ROOT=$(pwd)
 MODEL=${MODEL:-.cache/freesplatter-scene-f16.gguf}
 MAXSPLATS=${MAXSPLATS:-500000}
-DEVICE=${DEVICE:-cpu}
-CLI=${CLI:-$ROOT/build/release/bin/free_splatter-cli}
+# GPU by default (CPU is ~50x slower); DEVICE=cpu is the explicit opt-in. The CLI
+# is resolved to the matching build, and the vulkan CLI is built if missing (it
+# isn't part of the default CPU build) — mirroring scripts/serve.sh for the .so.
+DEVICE=${DEVICE:-vulkan}
+if [ "$DEVICE" = cpu ]; then
+  CLI=${CLI:-$ROOT/build/release/bin/free_splatter-cli}
+else
+  CLI=${CLI:-$ROOT/build/vulkan/bin/free_splatter-cli}
+  if [ ! -x "$CLI" ]; then
+    echo "building vulkan CLI ($CLI) ..." >&2
+    cmake -S "$ROOT" -B "$ROOT/build/vulkan" -DFREE_SPLATTER_VULKAN=ON -DFREE_SPLATTER_BUILD_SHARED=ON >&2
+    cmake --build "$ROOT/build/vulkan" --target free_splatter-cli >&2
+  fi
+fi
 
 [ "$#" -ge 3 ] || { echo "usage: $0 OUT_DIR FRAME0 FRAME1 [FRAME2 ...]  (>=2 frames)" >&2; exit 1; }
 OUT=$1; shift
