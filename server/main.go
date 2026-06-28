@@ -6,10 +6,14 @@
 //   cd server && go run . [-models scene=A.gguf,object=B.gguf] [-device vulkan] [-addr :8080]
 //
 // REST API:
-//   GET  /api/models         -> [{name,label,hint,views,size}, ...]
-//   POST /api/reconstruct     multipart "images" (>=1) + optional "model" -> {id,model,n_views,n_splats,size,seconds}
-//   GET  /api/splat/{id}      -> the .splat bytes (importance-sorted, 32B/splat)
-//   GET  /                    -> embedded frontend (web/)
+//   GET  /api/models          -> [{name,label,hint,views,size}, ...]
+//   POST /api/reconstruct      multipart "images" (>=1) + optional "model" -> {id,model,n_views,n_splats,size,seconds}
+//   GET  /api/splat/{id}       -> the .splat bytes (importance-sorted, 32B/splat)
+//   GET  /api/scenes           -> accumulating-reconstruction scenes [{name,label,steps,thumb,source}, ...]
+//   POST /api/scene/from-video  multipart "video" + "name" -> {job}  (gated in-process accumulate)
+//   GET  /api/scene/status/{job} -> {state,total,done,kept,scene,error}
+//   GET  /scenes-assets/...    -> a scene's manifest.json + .splat + thumbnails
+//   GET  / , /accumulate.html  -> embedded frontend (reconstruct page + scene viewer)
 package main
 
 import (
@@ -53,12 +57,17 @@ type server struct {
 	opts        options
 	bgRemoveCmd string // external matting command ("" = feature disabled)
 	demoDir     string // static dir served at /demo-assets/ (manifest + splats + images); "" = off
+	scenesDir   string // accumulating-reconstruction scenes (per-subdir steps-manifest); "" = off
 	workDir     string // scratch root for demo video frames + encoded MP4s
 
 	mu      sync.Mutex
 	results map[string][]byte
 	order2  []string
 	counter int64
+
+	jobsMu  sync.Mutex
+	jobs    map[string]*sceneJob
+	bakeSem chan struct{} // capacity 1: at most one video->scene bake at a time
 }
 
 func respondJSON(w http.ResponseWriter, v any) {
@@ -255,6 +264,7 @@ func main() {
 	bgCmd := flag.String("bgremove-cmd", "",
 		"external background-removal command for the object path ({in}/{out} are batch dirs), e.g. 'rembg p -m u2netp {in} {out}'")
 	demoDir := flag.String("demo-dir", "", "directory of baked demo assets (manifest.json + .splat + images) served at /demo-assets/")
+	scenesDir := flag.String("scenes-dir", "", "root of accumulating-reconstruction scenes (per-subdir steps-manifest); listed at /api/scenes, served at /scenes-assets/, written by video uploads. Default: the -demo-dir value")
 	workDir := flag.String("work-dir", filepath.Join(os.TempDir(), "freesplatter-demo"), "scratch root for demo video frames + encoded MP4s")
 	flag.Parse()
 
@@ -274,13 +284,20 @@ func main() {
 	if *demoDir != "" {
 		demoAbs, _ = filepath.Abs(*demoDir)
 	}
+	scenesAbs := demoAbs // default: scenes live alongside the baked demo assets
+	if *scenesDir != "" {
+		scenesAbs, _ = filepath.Abs(*scenesDir)
+	}
 	s := &server{
 		models:      map[string]*Engine{},
 		opts:        options{maxSplats: *maxSplats, opacThr: float32(*opacThr)},
 		bgRemoveCmd: *bgCmd,
 		demoDir:     demoAbs,
+		scenesDir:   scenesAbs,
 		workDir:     *workDir,
 		results:     map[string][]byte{},
+		jobs:        map[string]*sceneJob{},
+		bakeSem:     make(chan struct{}, 1),
 	}
 	if *bgCmd != "" {
 		log.Printf("background removal enabled: %s", *bgCmd)
@@ -309,9 +326,16 @@ func main() {
 	mux.HandleFunc("/api/demo/frame", s.handleDemoFrame)
 	mux.HandleFunc("/api/demo/encode", s.handleDemoEncode)
 	mux.HandleFunc("/api/demo/video/", s.handleDemoVideo)
+	mux.HandleFunc("/api/scenes", s.handleScenes)
+	mux.HandleFunc("/api/scene/from-video", s.handleSceneFromVideo)
+	mux.HandleFunc("/api/scene/status/", s.handleSceneStatus)
 	if s.demoDir != "" {
 		mux.Handle("/demo-assets/", http.StripPrefix("/demo-assets/", http.FileServer(http.Dir(s.demoDir))))
 		log.Printf("serving demo assets from %s at /demo-assets/ (work dir %s)", s.demoDir, s.workDir)
+	}
+	if s.scenesDir != "" {
+		mux.Handle("/scenes-assets/", http.StripPrefix("/scenes-assets/", http.FileServer(http.Dir(s.scenesDir))))
+		log.Printf("serving scenes from %s at /scenes-assets/ (list: /api/scenes)", s.scenesDir)
 	}
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 

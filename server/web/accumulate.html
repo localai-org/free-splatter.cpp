@@ -63,6 +63,20 @@
     border: 1px solid rgba(255,255,255,.25); box-shadow: 0 8px 26px rgba(0,0,0,.5); }
   #banner.show { display: block; opacity: 1; transform: translateX(-50%) translateY(0); }
   #banner b { font-weight: 750; }
+  /* scene switcher + video upload (server mode only) */
+  #server-ui { display: none; margin-top: 10px; border-top: 1px solid rgba(255,255,255,.08); padding-top: 10px; }
+  #server-ui .srow { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  #server-ui label { color: #8b93a1; font-size: 11.5px; }
+  #server-ui select, #server-ui input[type=text] { flex: 1; min-width: 0; background: rgba(255,255,255,.06);
+    color: #e8eaed; border: 1px solid rgba(255,255,255,.12); border-radius: 8px; padding: 4px 8px; font-size: 12px; }
+  #server-ui .up { display: flex; flex-direction: column; gap: 6px; }
+  #server-ui input[type=file] { font-size: 11px; color: #9aa3b2; }
+  #server-ui #vid-go { padding: 5px 8px; font-size: 12px; color: #e8eaed; cursor: pointer;
+    background: rgba(91,140,255,.18); border: 1px solid rgba(122,162,255,.5); border-radius: 8px; }
+  #server-ui #vid-go:hover { background: rgba(91,140,255,.3); }
+  #server-ui #vid-go:disabled { opacity: .5; cursor: default; }
+  #vid-bar { height: 5px; background: rgba(255,255,255,.08); border-radius: 99px; overflow: hidden; display: none; }
+  #vid-bar > div { height: 100%; width: 0; background: linear-gradient(90deg,#5b8cff,#22a05a); transition: width .3s ease; }
 </style>
 </head>
 <body>
@@ -76,6 +90,15 @@
   <div class="stat"><span>fps</span><span id="s-fps">—</span></div>
   <div id="status">starting…</div>
   <div id="ctl"><button id="prev">‹ prev</button><button id="play">⏸ pause</button><button id="next">next ›</button></div>
+  <div id="server-ui">
+    <div class="srow"><label>scene</label><select id="scene-sel"></select></div>
+    <div class="up">
+      <input type="file" id="vid" accept="video/*"/>
+      <input type="text" id="vid-name" placeholder="scene name (a-z0-9-)"/>
+      <button id="vid-go">＋ make scene from video</button>
+      <div id="vid-bar"><div></div></div>
+    </div>
+  </div>
 </div>
 <div id="strip"></div>
 <div id="banner"></div>
@@ -84,7 +107,11 @@
 <script type="module">
 const ROW = 32;                       // bytes per splat
 const _q = new URLSearchParams(location.search);
-const BASE = (_q.get("dir") || ".").replace(/\/$/, "");
+// BASE is the dir holding manifest.json + splats. Set by ?dir= (standalone baked
+// dir), else chosen at runtime: server mode = /scenes-assets/<scene>, standalone
+// fallback = "." (manifest.json next to this page).
+let BASE = (_q.get("dir") || "").replace(/\/$/, "");
+let serverMode = false;
 const STEP_MS = +(_q.get("ms") || 2600);
 const START_STEP = parseInt(_q.get("start") || "0", 10);   // begin at this step
 const AUTOPLAY = _q.get("auto") !== "0";                    // ?auto=0 = no advance
@@ -350,17 +377,92 @@ $("prev").onclick = ()=>{ playing=false; $("play").textContent="▶ play"; loadS
 $("next").onclick = ()=>{ playing=false; $("play").textContent="▶ play"; loadStep(Math.min(manifest.steps.length-1,cur+1)); };
 $("play").onclick = ()=>{ playing=!playing; $("play").textContent = playing?"⏸ pause":"▶ play"; schedule(); };
 
-(async function start(){
-  requestAnimationFrame(render);
+// load the manifest at the current BASE and start (re-entrant: resets per scene).
+async function loadManifestAndPlay(){
+  clearTimeout(timer);
+  manifest=null; cur=-1; framed=false;
   try {
     setStatus("loading manifest…");
     manifest = await (await fetch(`${BASE}/manifest.json`, { cache: "no-store" })).json();
     if(!manifest.steps || !manifest.steps.length) throw new Error("manifest has no steps");
     const s0 = Math.max(0, Math.min(manifest.steps.length-1, START_STEP));
+    playing = AUTOPLAY;
     await loadStep(s0);
     $("play").textContent = playing ? "⏸ pause" : "▶ play";
     schedule();
   } catch(err){ setStatus("manifest.json not found — "+err.message, true); console.error(err); }
+}
+
+// ---------- scene switching (server mode) ----------
+function populateScenes(scenes){
+  const sel=$("scene-sel"); sel.innerHTML="";
+  for (const sc of scenes){
+    const o=document.createElement("option"); o.value=sc.name;
+    o.textContent=`${sc.label} · ${sc.steps} steps`; sel.appendChild(o);
+  }
+}
+async function selectScene(name){
+  if(!name) return;
+  $("scene-sel").value = name;
+  BASE = "/scenes-assets/" + name;
+  await loadManifestAndPlay();
+}
+$("scene-sel").onchange = () => selectScene($("scene-sel").value);
+
+// ---------- upload a video -> bake a scene ----------
+function slug(s){ return (s||"").toLowerCase().replace(/[^a-z0-9_-]+/g,"-").replace(/^-+|-+$/g,"").slice(0,48); }
+$("vid").onchange = () => { if(!$("vid-name").value && $("vid").files[0])
+  $("vid-name").value = slug($("vid").files[0].name.replace(/\.[^.]+$/,"")); };
+$("vid-go").onclick = async () => {
+  const f = $("vid").files[0];
+  const nm = slug($("vid-name").value || (f && f.name.replace(/\.[^.]+$/,"")));
+  if(!f){ setStatus("pick a video first", true); return; }
+  if(!nm){ setStatus("enter a scene name", true); return; }
+  const fd = new FormData(); fd.append("video", f); fd.append("name", nm);
+  const go=$("vid-go"), bar=$("vid-bar"); go.disabled=true; bar.style.display="block"; bar.firstElementChild.style.width="0%";
+  setStatus(`uploading ${f.name}…`);
+  let resp;
+  try { resp = await fetch("/api/scene/from-video", { method:"POST", body:fd }); }
+  catch(e){ setStatus("upload failed: "+e.message, true); go.disabled=false; return; }
+  if(!resp.ok){ setStatus("rejected: "+(await resp.text()).trim(), true); go.disabled=false; bar.style.display="none"; return; }
+  const { job } = await resp.json();
+  const poll = setInterval(async () => {
+    let st; try { st = await (await fetch("/api/scene/status/"+encodeURIComponent(job), {cache:"no-store"})).json(); }
+    catch(e){ return; }
+    if(st.state==="running"){
+      setStatus(`baking ${nm}: ${st.done}/${st.total} frames · ${st.kept} kept`);
+      bar.firstElementChild.style.width = st.total ? Math.round(st.done/st.total*100)+"%" : "0%";
+    } else if(st.state==="done"){
+      clearInterval(poll); go.disabled=false; bar.firstElementChild.style.width="100%";
+      const scenes=(await (await fetch("/api/scenes",{cache:"no-store"})).json()).scenes;
+      populateScenes(scenes); await selectScene(st.scene);
+      setTimeout(()=>{ bar.style.display="none"; }, 1200);
+    } else if(st.state==="error"){
+      clearInterval(poll); go.disabled=false; bar.style.display="none";
+      setStatus("bake failed: "+st.error, true);
+    }
+  }, 1200);
+};
+
+// ---------- init: server mode (scene list) vs standalone (?dir / local manifest) ----------
+(async function init(){
+  requestAnimationFrame(render);
+  if (BASE) { await loadManifestAndPlay(); return; }   // ?dir= : explicit standalone dir
+  let scenes = null;
+  try { const r = await fetch("/api/scenes", { cache:"no-store" }); if(r.ok) scenes = (await r.json()).scenes; } catch(e){}
+  if (scenes !== null) {                                // served by the Go app
+    serverMode = true;
+    $("server-ui").style.display = "block";
+    populateScenes(scenes);
+    if (scenes.length) {
+      const want = _q.get("scene");
+      const pick = scenes.find(s => s.name === want) ? want : scenes[0].name;
+      await selectScene(pick);
+    } else setStatus("no scenes yet — upload a video to make one");
+    return;
+  }
+  BASE = ".";                                           // standalone baked dir: manifest.json next to this page
+  await loadManifestAndPlay();
 })();
 </script>
 </body>

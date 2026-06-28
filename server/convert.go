@@ -142,6 +142,52 @@ func encodeSplat(g []float32, opacThr float32, maxSplats int) ([]byte, int) {
 	return buf, m
 }
 
+// encodeCloudSplat converts an accumulator cloud ([]point) to antimatter15 .splat
+// bytes — mirroring tools/free_splatter-cli.cpp write_cloud_splat + src/splat.h
+// encode_splat_record. CRITICAL: unlike encodeSplat (raw gaussians), the cloud's
+// R/G/B are ALREADY activated linear colour in [0,1] — do NOT apply the SH-DC
+// transform. Importance = opacity*sx*sy*sz; sort+cap only when capping (else keep
+// order). Scale is multiplied by scaleMult; pos/quat get the OpenCV->OpenGL flip.
+func encodeCloudSplat(pts []point, maxSplats int, scaleMult float32) []byte {
+	n := len(pts)
+	idx := make([]int, n)
+	for i := range idx {
+		idx[i] = i
+	}
+	imp := func(i int) float64 {
+		p := pts[i]
+		vol := float64(maxf(p.Sx, 1e-9)) * float64(maxf(p.Sy, 1e-9)) * float64(maxf(p.Sz, 1e-9))
+		return float64(maxf(p.Opacity, 0)) * vol
+	}
+	m := n
+	if maxSplats > 0 && n > maxSplats {
+		sort.Slice(idx, func(a, b int) bool { return imp(idx[a]) > imp(idx[b]) })
+		m = maxSplats
+		idx = idx[:m]
+	}
+	buf := make([]byte, m*32)
+	for k, i := range idx {
+		p := pts[i]
+		o := k * 32
+		putf(buf[o:], p.X)
+		putf(buf[o+4:], -p.Y)
+		putf(buf[o+8:], -p.Z)
+		putf(buf[o+12:], scaleMult*p.Sx)
+		putf(buf[o+16:], scaleMult*p.Sy)
+		putf(buf[o+20:], scaleMult*p.Sz)
+		buf[o+24] = u8(clamp01(float64(p.R)) * 255.0)
+		buf[o+25] = u8(clamp01(float64(p.G)) * 255.0)
+		buf[o+26] = u8(clamp01(float64(p.B)) * 255.0)
+		buf[o+27] = u8(clamp01(float64(p.Opacity)) * 255.0)
+		q := [4]float64{-float64(p.Qx), float64(p.Qw), -float64(p.Qz), float64(p.Qy)}
+		nrm := math.Sqrt(q[0]*q[0]+q[1]*q[1]+q[2]*q[2]+q[3]*q[3]) + 1e-12
+		for c := 0; c < 4; c++ {
+			buf[o+28+c] = u8(q[c]/nrm*128.0 + 128.0)
+		}
+	}
+	return buf
+}
+
 func putf(b []byte, v float32) { binary.LittleEndian.PutUint32(b, math.Float32bits(v)) }
 
 func maxf(a, b float32) float32 {
