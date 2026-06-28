@@ -225,6 +225,27 @@ int free_splatter_estimate_poses(const float * gaussians, int32_t n_views, int32
     return 0;
 }
 
+int free_splatter_pair_parallax(const float * gaussians, int32_t n_views, int32_t height,
+                                int32_t width, int32_t gaussian_channels,
+                                float opacity_threshold, free_splatter_parallax * out) {
+    if (!gaussians || !out || n_views < 2 || height < 1 || width < 1 || gaussian_channels < 16)
+        return -1;
+    const int P = height * width;
+    std::vector<std::vector<float>> pts, ops;
+    std::vector<const float *> pptr, optr;
+    deinterleave(gaussians, n_views, P, gaussian_channels, pts, ops, pptr, optr);
+    free_splatter::pose::Parallax px =
+        free_splatter::pose::pair_parallax(pptr, optr, height, width, opacity_threshold);
+    out->tri_angle_deg       = (float) px.tri_angle_deg;
+    out->lateral_angle_deg   = (float) px.lateral_angle_deg;
+    out->baseline_over_depth = (float) px.baseline_over_depth;
+    out->baseline            = (float) px.baseline;
+    out->median_depth        = (float) px.median_depth;
+    out->focal               = (float) px.focal;
+    out->n_points            = px.n_points;
+    return 0;
+}
+
 free_splatter_accumulator * free_splatter_accumulator_new(int32_t height, int32_t width,
                                                           float opacity_threshold) {
     if (height < 1 || width < 1) return nullptr;

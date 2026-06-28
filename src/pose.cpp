@@ -849,6 +849,75 @@ PoseResult estimate_poses(const std::vector<const float *> & points,
     return res;
 }
 
+// ---- after-inference parallax ---------------------------------------------
+
+Parallax parallax_stats(const Vec3 & C0, const Vec3 & C1, const Vec3 & axis0,
+                        const float * pts, const float * mask, int N, double mask_thr) {
+    constexpr double PI = 3.14159265358979323846;
+    auto sub = [](const Vec3 & a, const Vec3 & b) -> Vec3 { return { a[0]-b[0], a[1]-b[1], a[2]-b[2] }; };
+    auto dot = [](const Vec3 & a, const Vec3 & b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; };
+    auto nrm = [&](const Vec3 & a) { return std::sqrt(dot(a, a)); };
+
+    Parallax px{};
+    // unit optical axis of view 0
+    Vec3 ax = axis0; const double an = nrm(ax);
+    if (an > 1e-12) { ax[0]/=an; ax[1]/=an; ax[2]/=an; }
+
+    // baseline split: forward (dolly, no parallax) vs lateral (strafe, parallax)
+    const Vec3 b = sub(C1, C0);
+    px.baseline = nrm(b);
+    const double fwd = dot(b, ax);
+    const Vec3 blat = { b[0]-fwd*ax[0], b[1]-fwd*ax[1], b[2]-fwd*ax[2] };
+    px.lateral_angle_deg = std::atan2(nrm(blat), std::fabs(fwd)) * 180.0 / PI;
+
+    // per confident point: depth from cam0 + triangulation angle (rays from C0,C1)
+    std::vector<double> depths, angles;
+    depths.reserve(N); angles.reserve(N);
+    for (int i = 0; i < N; i++) {
+        if (mask && !(mask[i] > mask_thr)) continue;
+        const Vec3 X = { (double)pts[3*i], (double)pts[3*i+1], (double)pts[3*i+2] };
+        if (!std::isfinite(X[0]) || !std::isfinite(X[1]) || !std::isfinite(X[2])) continue;
+        const Vec3 r0 = sub(X, C0), r1 = sub(X, C1);
+        const double n0 = nrm(r0), n1 = nrm(r1);
+        if (n0 < 1e-9 || n1 < 1e-9) continue;
+        const double depth = dot(r0, ax);
+        if (depth > 0) depths.push_back(depth);
+        double c = dot(r0, r1) / (n0 * n1);
+        c = c < -1.0 ? -1.0 : (c > 1.0 ? 1.0 : c);
+        angles.push_back(std::acos(c) * 180.0 / PI);
+    }
+    auto median = [](std::vector<double> & v) -> double {
+        if (v.empty()) return 0.0;
+        const size_t m = v.size() / 2;
+        std::nth_element(v.begin(), v.begin() + m, v.end());
+        return v[m];
+    };
+    px.median_depth = median(depths);
+    px.tri_angle_deg = median(angles);
+    px.baseline_over_depth = (px.median_depth > 1e-9) ? px.baseline / px.median_depth : 0.0;
+    px.n_points = (int) angles.size();
+    return px;
+}
+
+Parallax pair_parallax(const std::vector<const float *> & points,
+                       const std::vector<const float *> & opacities,
+                       int H, int W, double opacity_threshold, double focal) {
+    Parallax px{};
+    if (points.size() < 2) return px;
+    PoseResult pr = estimate_poses(points, opacities, H, W, opacity_threshold,
+                                   focal, 100, /*normalize=*/false, /*seed=*/0);
+    if (pr.cam2world.size() < 2) return px;
+    const Mat4 & c0 = pr.cam2world[0];
+    const Mat4 & c1 = pr.cam2world[1];
+    const Vec3 C0 = { c0(0,3), c0(1,3), c0(2,3) };
+    const Vec3 C1 = { c1(0,3), c1(1,3), c1(2,3) };
+    const Vec3 axis0 = { c0(0,2), c0(1,2), c0(2,2) };   // camera +z (optical axis) in world
+    px = parallax_stats(C0, C1, axis0, points[0],
+                        opacities.empty() ? nullptr : opacities[0], H * W, opacity_threshold);
+    px.focal = pr.focal;
+    return px;
+}
+
 // ---- accumulation ---------------------------------------------------------
 
 namespace {

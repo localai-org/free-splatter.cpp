@@ -719,8 +719,39 @@ static void test_accumulate_channels() {
     check("every gaussian channel survives run-0 accumulation", ok);
 }
 
+// Golden: parallax_stats on synthetic cameras with hand-computed angles. A
+// lateral (strafe) baseline yields a large triangulation/lateral angle; a pure
+// forward (dolly) baseline of the SAME length yields ~0 — the whole point of the
+// metric (it measures depth-resolving motion, not raw camera displacement).
+static void test_parallax_geometry() {
+    std::printf("test_parallax_geometry\n");
+    const double DEG = 180.0 / 3.14159265358979323846;
+    const Vec3 axis0 = { 0, 0, 1 };                 // view-0 looks down +z
+    // points at depth 1 (a few, all same depth -> clean medians)
+    const int N = 5;
+    std::vector<float> pts(3 * N);
+    for (int i = 0; i < N; i++) { pts[3*i]=0.0f; pts[3*i+1]=0.0f; pts[3*i+2]=1.0f; }
+
+    // (1) pure strafe: baseline 0.1 along x, perpendicular to the optical axis
+    Parallax s = parallax_stats({0,0,0}, {0.1,0,0}, axis0, pts.data(), nullptr, N, 0.0);
+    const double tri_expect = std::atan(0.1) * DEG;            // 5.7106 deg
+    char b1[96]; std::snprintf(b1, sizeof b1, "strafe lateral=%.3f tri=%.3f (expect 90, %.3f)", s.lateral_angle_deg, s.tri_angle_deg, tri_expect);
+    check("strafe -> lateral angle ~90 deg", std::fabs(s.lateral_angle_deg - 90.0) < 1e-3, b1);
+    check("strafe -> tri angle = atan(B/Z)", std::fabs(s.tri_angle_deg - tri_expect) < 1e-3, b1);
+    check("strafe -> B/Z = 0.1", std::fabs(s.baseline_over_depth - 0.1) < 1e-4);
+    check("strafe -> median depth = 1", std::fabs(s.median_depth - 1.0) < 1e-4);
+
+    // (2) pure dolly: SAME baseline length 0.1 but along the optical axis
+    Parallax d = parallax_stats({0,0,0}, {0,0,0.1}, axis0, pts.data(), nullptr, N, 0.0);
+    char b2[96]; std::snprintf(b2, sizeof b2, "dolly lateral=%.3f tri=%.3f (expect ~0)", d.lateral_angle_deg, d.tri_angle_deg);
+    check("dolly -> lateral angle ~0 deg", std::fabs(d.lateral_angle_deg) < 1e-3, b2);
+    check("dolly -> tri angle ~0 deg (no parallax)", std::fabs(d.tri_angle_deg) < 1e-3, b2);
+    check("dolly baseline equals strafe baseline", std::fabs(d.baseline - s.baseline) < 1e-6);
+}
+
 int main() {
     test_similarity_roundtrip();
+    test_parallax_geometry();
     test_scale_detection();
     test_nonlinear_detection();
     test_outlier_robustness();
