@@ -130,11 +130,17 @@ static int usage(const char * a0) {
         "\n"
         "accumulate mode (>=2 images -> one world from the photo stream):\n"
         "  %s --accumulate [--splat-prefix P] [--fuse] [--voxel V] [--fuse-k K]\n"
-        "     [--splat-scale S] [--max-splats N] MODEL.gguf IMG0 IMG1 IMG2 ...\n"
+        "     [--min-parallax DEG] [--splat-scale S] [--max-splats N] MODEL.gguf IMG0 IMG1 ...\n"
         "  runs the engine on each consecutive pair, chains the runs (Sim(3)) into\n"
         "  one accumulating cloud; writes P_<nframes>.splat after each pair (the\n"
-        "  evolving reconstruction) and, with --fuse, a consensus-fused P_fused.splat.\n",
-        a0, a0);
+        "  evolving reconstruction) and, with --fuse, a consensus-fused P_fused.splat.\n"
+        "  --min-parallax gates by keyframe: a candidate frame is folded in only if its\n"
+        "  triangulation angle vs the last kept frame is >= DEG (else its depth is\n"
+        "  ill-conditioned); image mode only.\n"
+        "\n"
+        "parallax (depth conditioning of one pair, after-inference):\n"
+        "  %s --parallax MODEL.gguf (IMG0 IMG1 | PAIR.f32)\n",
+        a0, a0, a0);
     return 2;
 }
 
@@ -148,6 +154,7 @@ int main(int argc, char ** argv) {
     float voxel = 0.02f, splat_scale = 1.0f;   // multiplier on the predicted gaussian radii
     int   fuse_k = 2;
     bool  refine = false; int refine_iters = 8; float refine_voxel = 0.03f, refine_alpha = 0.5f;  // geometric de-ghost
+    float min_parallax = 0.0f;                   // deg; >0 gates accumulate by keyframe parallax
     std::vector<std::string> inputs;
 
     for (int i = 1; i < argc; i++) {
@@ -170,6 +177,7 @@ int main(int argc, char ** argv) {
         else if (a == "--refine-iters" && i+1 < argc)   refine_iters = atoi(argv[++i]);
         else if (a == "--refine-voxel" && i+1 < argc)   refine_voxel = (float) atof(argv[++i]);
         else if (a == "--refine-alpha" && i+1 < argc)   refine_alpha = (float) atof(argv[++i]);
+        else if (a == "--min-parallax" && i+1 < argc)   min_parallax = (float) atof(argv[++i]);
         else if (a == "--splat-scale" && i+1 < argc)    splat_scale = (float) atof(argv[++i]);
         else if (a == "-h" || a == "--help")            return usage(argv[0]);
         else if (!model)                                model = argv[i];
@@ -257,11 +265,26 @@ int main(int argc, char ** argv) {
         free_splatter_accumulator * acc = free_splatter_accumulator_new(sz, sz, opac_thr);
         if (!acc) { std::fprintf(stderr, "accumulator alloc failed\n"); free_splatter_free(ctx); return 1; }
 
-        for (size_t k = 0; k < npairs; k++) {
-            const float * g = nullptr;
-            std::vector<float> dumpbuf;
-            float * runout = nullptr;
-            if (dump_mode) {
+        // emit the accumulated cloud after a pair is folded in (optional de-ghost)
+        auto emit_step = [&](int nframes) {
+            if (!splat_prefix) return;
+            free_splatter_point * cloud = nullptr; size_t nc = 0;
+            free_splatter_accumulator_cloud(acc, &cloud, &nc);
+            if (refine && nframes >= 2)               // geometric de-ghost a copy (internal untouched)
+                free_splatter_refine_cloud(cloud, nc, refine_voxel, refine_iters, refine_alpha);
+            char path[1024];
+            std::snprintf(path, sizeof path, "%s_%d.splat", splat_prefix, nframes);
+            write_cloud_splat(cloud, nc, (size_t) max_splats, splat_scale, path);
+            free_splatter_buf_free(cloud);
+        };
+
+        if (dump_mode) {
+            // fixed pre-computed pairs: cannot re-anchor, so the parallax gate
+            // (which works by re-pairing keyframes) does not apply here.
+            if (min_parallax > 0.0f)
+                std::fprintf(stderr, "note: --min-parallax re-pairs keyframes; ignored for "
+                                     ".f32 dumps (fixed pairs) -- accumulating all.\n");
+            for (size_t k = 0; k < npairs; k++) {
                 std::ifstream f(inputs[k], std::ios::binary | std::ios::ate);
                 if (!f) { std::fprintf(stderr, "cannot open %s\n", inputs[k].c_str()); free_splatter_accumulator_free(acc); free_splatter_free(ctx); return 1; }
                 const std::streamsize bytes = f.tellg(); f.seekg(0);
@@ -269,32 +292,44 @@ int main(int argc, char ** argv) {
                     std::fprintf(stderr, "dump %s: %zu floats, expected 2*%d*%d*%d\n", inputs[k].c_str(),
                                  (size_t)(bytes/sizeof(float)), sz, sz, gc);
                     free_splatter_accumulator_free(acc); free_splatter_free(ctx); return 1; }
-                dumpbuf.resize(pair_floats); f.read((char *) dumpbuf.data(), bytes);
-                g = dumpbuf.data();
-            } else {
+                std::vector<float> dumpbuf(pair_floats); f.read((char *) dumpbuf.data(), bytes);
+                free_splatter_accumulator_add_pair(acc, dumpbuf.data(), gc);
+                const int nframes = free_splatter_accumulator_frame_count(acc);
+                std::printf("pair %zu -> %d frames\n", k, nframes);
+                emit_step(nframes);
+            }
+        } else {
+            // image mode: keyframe gating. Pair the next candidate against the last
+            // KEPT frame; fold it in only if its parallax clears --min-parallax
+            // (else its depth is ill-conditioned). Threshold 0 -> every consecutive
+            // pair, identical to the ungated path.
+            size_t last_kept = 0; int skipped = 0;
+            for (size_t j = 1; j < frames.size(); j++) {
                 std::vector<float> pair(2 * per_view);
-                std::memcpy(&pair[0],        frames[k].data(),   per_view * sizeof(float));
-                std::memcpy(&pair[per_view], frames[k+1].data(), per_view * sizeof(float));
-                size_t ng = 0;
+                std::memcpy(&pair[0],        frames[last_kept].data(), per_view * sizeof(float));
+                std::memcpy(&pair[per_view], frames[j].data(),         per_view * sizeof(float));
+                float * runout = nullptr; size_t ng = 0;
                 if (free_splatter_run(ctx, pair.data(), 2, sz, sz, &runout, &ng) != 0) {
-                    std::fprintf(stderr, "run pair %zu failed: %s\n", k, free_splatter_last_error(ctx));
+                    std::fprintf(stderr, "run pair (%zu,%zu) failed: %s\n", last_kept, j, free_splatter_last_error(ctx));
                     free_splatter_accumulator_free(acc); free_splatter_free(ctx); return 1; }
-                g = runout;
+                if (min_parallax > 0.0f) {
+                    free_splatter_parallax px;
+                    free_splatter_pair_parallax(runout, 2, sz, sz, gc, opac_thr, &px);
+                    if (px.tri_angle_deg < min_parallax) {
+                        std::printf("skip frame %zu: parallax %.1f deg < %.1f (vs kept frame %zu)\n",
+                                    j, px.tri_angle_deg, min_parallax, last_kept);
+                        free_splatter_buf_free(runout); skipped++; continue;
+                    }
+                    std::printf("keep frame %zu: parallax %.1f deg (vs kept frame %zu)\n", j, px.tri_angle_deg, last_kept);
+                }
+                free_splatter_accumulator_add_pair(acc, runout, gc);
+                free_splatter_buf_free(runout);
+                const int nframes = free_splatter_accumulator_frame_count(acc);
+                std::printf("pair (%zu,%zu) -> %d frames\n", last_kept, j, nframes);
+                emit_step(nframes);
+                last_kept = j;
             }
-            free_splatter_accumulator_add_pair(acc, g, gc);
-            if (runout) free_splatter_buf_free(runout);
-            const int nframes = free_splatter_accumulator_frame_count(acc);
-            std::printf("pair %zu -> %d frames\n", k, nframes);
-            if (splat_prefix) {
-                free_splatter_point * cloud = nullptr; size_t nc = 0;
-                free_splatter_accumulator_cloud(acc, &cloud, &nc);
-                if (refine && nframes >= 2)            // geometric de-ghost a copy (internal untouched)
-                    free_splatter_refine_cloud(cloud, nc, refine_voxel, refine_iters, refine_alpha);
-                char path[1024];
-                std::snprintf(path, sizeof path, "%s_%d.splat", splat_prefix, nframes);
-                write_cloud_splat(cloud, nc, (size_t) max_splats, splat_scale, path);
-                free_splatter_buf_free(cloud);
-            }
+            if (skipped) std::printf("gated: skipped %d low-parallax frame(s)\n", skipped);
         }
         if (fuse && splat_prefix) {
             if (refine) free_splatter_accumulator_refine(acc, refine_voxel, refine_iters, refine_alpha);
