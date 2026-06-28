@@ -83,6 +83,6 @@ thumb() { printf '"view_%s.jpg"' "$1"; }       # thumbnail referenced by origina
 echo "kept frames (input indices): ${kept[*]}  of ${#FRAMES[@]}"
 
 # 4) the viewer, self-contained next to its assets
-cp "$ROOT/web/accumulate.html" "$OUT/index.html"
+cp "$ROOT/server/web/accumulate.html" "$OUT/index.html"   # single source; standalone-fallback to ./manifest.json
 echo "demo baked -> $OUT"
 echo "serve: (cd $OUT && python3 -m http.server 8080)  then open http://localhost:8080/"

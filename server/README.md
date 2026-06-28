@@ -26,7 +26,26 @@ CGO_ENABLED=0 go run . \
 `net/http` the pure-Go resolver so the server builds on a bare `PATH`.
 
 Flags: `-addr` `-lib` `-models` (comma list of `name=path.gguf`; the first is the
-default) `-device` (`cpu`|`vulkan`|`vulkan:N`) `-max-splats` `-opacity-threshold`.
+default) `-device` (`vulkan` by default and **fail-closed** — it errors if no GPU
+is present rather than silently using the slow CPU path; pass `cpu` to opt in)
+`-max-splats` `-opacity-threshold` `-demo-dir` `-scenes-dir`.
+
+## Accumulating scenes + video upload (`/accumulate.html`)
+
+A second page plays the **growing-world** demo: pick a scene from the dropdown and
+watch its reconstruction build up as photos are folded in. The scenes are the
+accumulating-reconstruction dirs under `-scenes-dir` (default: the `-demo-dir`
+value) — any subdir whose `manifest.json` has a `steps` array, produced by
+`scripts/demo/bake-vids.sh` or by an upload. `GET /api/scenes` lists them (no
+restart needed when new ones appear).
+
+**Upload a video → it makes the scene.** The page's "make scene from video" control
+POSTs a clip to `POST /api/scene/from-video`; the server samples frames, runs the
+keyframe **parallax gate** (`--min-parallax`, default 8°) and the accumulate +
+best-frame fuse **in-process on the loaded GPU engine** (no shell-out, no second
+model load), and writes the scene dir. Progress streams via
+`GET /api/scene/status/{job}`; one bake runs at a time (HTTP 429 if busy). The new
+scene then appears in the dropdown automatically. Needs `ffmpeg` on `PATH`.
 
 ## Models
 

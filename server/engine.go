@@ -22,6 +22,19 @@ type geometry struct {
 	gaussianChannels int32
 }
 
+// point mirrors free_splatter_point exactly: 14 float32 + 1 int32 = 60 bytes, all
+// 4-byte aligned (no padding). Field ORDER is load-bearing across the C ABI.
+type point struct {
+	X, Y, Z, R, G, B, Opacity, Sx, Sy, Sz, Qw, Qx, Qy, Qz float32
+	Frame                                                 int32
+}
+
+// parallax mirrors free_splatter_parallax: 6 float32 + 1 int32 = 28 bytes.
+type parallax struct {
+	TriAngleDeg, LateralAngleDeg, BaselineOverDepth, Baseline, MedianDepth, Focal float32
+	NPoints                                                                       int32
+}
+
 // Lib is the dlopen'd shared library with the C API bound by name.
 type Lib struct {
 	handle uintptr
@@ -36,6 +49,15 @@ type Lib struct {
 	run        func(uintptr, unsafe.Pointer, int32, int32, int32, unsafe.Pointer, unsafe.Pointer) int32
 	bufFree    func(uintptr)
 	abiVersion func() int32
+
+	// accumulator + parallax (for in-process video->scene baking)
+	accNew      func(int32, int32, float32) uintptr
+	accFree     func(uintptr)
+	accAddPair  func(uintptr, unsafe.Pointer, int32) int32
+	accFrameCnt func(uintptr) int32
+	accCloud    func(uintptr, unsafe.Pointer, unsafe.Pointer) int32
+	accFuse     func(uintptr, float32, int32, int32, unsafe.Pointer, unsafe.Pointer) int32
+	parallaxFn  func(unsafe.Pointer, int32, int32, int32, int32, float32, unsafe.Pointer) int32
 }
 
 // Engine is one loaded model (context) belonging to a Lib.
@@ -79,6 +101,13 @@ func OpenLib(libPath string) (*Lib, error) {
 	purego.RegisterLibFunc(&l.run, handle, "free_splatter_run")
 	purego.RegisterLibFunc(&l.bufFree, handle, "free_splatter_buf_free")
 	purego.RegisterLibFunc(&l.abiVersion, handle, "free_splatter_abi_version")
+	purego.RegisterLibFunc(&l.accNew, handle, "free_splatter_accumulator_new")
+	purego.RegisterLibFunc(&l.accFree, handle, "free_splatter_accumulator_free")
+	purego.RegisterLibFunc(&l.accAddPair, handle, "free_splatter_accumulator_add_pair")
+	purego.RegisterLibFunc(&l.accFrameCnt, handle, "free_splatter_accumulator_frame_count")
+	purego.RegisterLibFunc(&l.accCloud, handle, "free_splatter_accumulator_cloud")
+	purego.RegisterLibFunc(&l.accFuse, handle, "free_splatter_accumulator_fuse")
+	purego.RegisterLibFunc(&l.parallaxFn, handle, "free_splatter_pair_parallax")
 	if v := l.abiVersion(); v != 1 {
 		purego.Dlclose(handle)
 		return nil, fmt.Errorf("ABI mismatch: library reports %d, expected 1", v)
@@ -148,4 +177,56 @@ func (e *Engine) Close() {
 		e.lib.free(e.ctx)
 		e.ctx = 0
 	}
+}
+
+// --- accumulator + parallax helpers (in-process video->scene baking) ---
+
+// pointsFromC copies a malloc'd free_splatter_point[n] to a Go slice and frees it.
+func (l *Lib) pointsFromC(ptr uintptr, n uint64) []point {
+	if ptr == 0 {
+		return nil
+	}
+	out := make([]point, int(n))
+	if n > 0 {
+		copy(out, unsafe.Slice((*point)(unsafe.Pointer(ptr)), int(n)))
+	}
+	l.bufFree(ptr)
+	return out
+}
+
+// accCloudCopy returns a copy of the accumulator's current cloud.
+func (l *Lib) accCloudCopy(acc uintptr) []point {
+	var ptr uintptr
+	var n uint64
+	if l.accCloud(acc, unsafe.Pointer(&ptr), unsafe.Pointer(&n)) != 0 {
+		return nil
+	}
+	return l.pointsFromC(ptr, n)
+}
+
+// accFuseCopy returns the consensus-fused cloud (voxelFrac, k, mode: 0 avg/1 kept/2 best).
+func (l *Lib) accFuseCopy(acc uintptr, voxelFrac float32, k, mode int32) []point {
+	var ptr uintptr
+	var n uint64
+	if l.accFuse(acc, voxelFrac, k, mode, unsafe.Pointer(&ptr), unsafe.Pointer(&n)) != 0 {
+		return nil
+	}
+	return l.pointsFromC(ptr, n)
+}
+
+// pairParallax computes the after-inference parallax of a 2-view gaussian buffer
+// (the layout Engine.Run returns for nViews=2).
+func (l *Lib) pairParallax(g []float32, h, w, gc int32, thr float32) (parallax, bool) {
+	var px parallax
+	rc := l.parallaxFn(unsafe.Pointer(&g[0]), 2, h, w, gc, thr, unsafe.Pointer(&px))
+	runtime.KeepAlive(g)
+	return px, rc == 0
+}
+
+// accAddPairSlice folds one pair's gaussians into the accumulator (the C side
+// copies them, so g may be reused after). Returns 0 on success.
+func (l *Lib) accAddPairSlice(acc uintptr, g []float32, gc int32) int32 {
+	rc := l.accAddPair(acc, unsafe.Pointer(&g[0]), gc)
+	runtime.KeepAlive(g)
+	return rc
 }
