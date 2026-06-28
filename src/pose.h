@@ -110,6 +110,32 @@ PoseResult estimate_poses(const std::vector<const float *> & points,
                           double focal = -1.0, int pnp_iter = 100,
                           bool normalize = false, uint64_t seed = 0);
 
+// ---- after-inference parallax (depth conditioning of a recovered pair) -------
+// Quantifies how well a 2-view pair constrains depth, from the model's OWN
+// recovered geometry. All angle fields are scale-invariant; B/Z is consistent
+// because cameras and points share the (un-normalized) view-0 frame.
+struct Parallax {
+    double tri_angle_deg;       // median triangulation angle over confident points
+    double lateral_angle_deg;   // baseline angle off view-0 optical axis (0=dolly, 90=strafe)
+    double baseline_over_depth; // ||C1-C0|| / median point depth from camera 0
+    double baseline;
+    double median_depth;
+    double focal;               // estimated (or supplied) focal, px
+    int    n_points;            // confident points used for the medians
+};
+
+// Pure geometry core (no PnP) — directly testable against hand-computed angles.
+// pts: 3*N view-0-frame points; mask: per-point weight (>thr kept), or nullptr.
+// axis0 need not be unit; it is normalized internally.
+Parallax parallax_stats(const Vec3 & C0, const Vec3 & C1, const Vec3 & axis0,
+                        const float * pts, const float * mask, int N, double mask_thr);
+
+// Full path: recover the pair's cameras (normalize=false), then parallax_stats.
+// points/opacities: 2 views (view-0-frame xyz + activated opacity), as estimate_poses.
+Parallax pair_parallax(const std::vector<const float *> & points,
+                       const std::vector<const float *> & opacities,
+                       int H, int W, double opacity_threshold = 0.05, double focal = -1.0);
+
 // ---- accumulation: chain successive runs into one world (mirrors accumulate.py)
 // One accumulated 3D gaussian in the global frame, tagged with the source frame
 // it came from (consensus fusion needs the frame id). Carries the full anisotropic

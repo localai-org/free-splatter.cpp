@@ -143,7 +143,7 @@ int main(int argc, char ** argv) {
     const char * model = nullptr, * splat_prefix = nullptr;
     float opac_thr = 5e-3f;
     long  max_splats = 0;
-    bool  accumulate = false, fuse = false;
+    bool  accumulate = false, fuse = false, parallax = false;
     int   fuse_mode = 1;                         // 0 averaged, 1 kept, 2 best-frame
     float voxel = 0.02f, splat_scale = 1.0f;   // multiplier on the predicted gaussian radii
     int   fuse_k = 2;
@@ -159,6 +159,7 @@ int main(int argc, char ** argv) {
         else if (a == "--opacity-threshold" && i+1<argc) opac_thr = (float) atof(argv[++i]);
         else if (a == "--max-splats" && i+1 < argc)     max_splats = atol(argv[++i]);
         else if (a == "--accumulate")                   accumulate = true;
+        else if (a == "--parallax")                     parallax = true;
         else if (a == "--splat-prefix" && i+1 < argc)   splat_prefix = argv[++i];
         else if (a == "--fuse")                         fuse = true;
         else if (a == "--voxel" && i+1 < argc)          voxel = (float) atof(argv[++i]);
@@ -191,6 +192,44 @@ int main(int argc, char ** argv) {
     std::printf("model: %dx%d, in=%d, gaussian_channels=%d\n",
                 geo.image_width, geo.image_height, geo.in_channels, geo.gaussian_channels);
     if (inputs.empty()) { free_splatter_free(ctx); return 0; }
+
+    // ---- parallax mode: depth-conditioning of a pair (after-inference) --------
+    // Input: exactly two images (engine runs the pair) or one [2,H,W,gc] .f32
+    // gaussian-output dump. Prints the recovered-geometry parallax stats.
+    if (parallax) {
+        const int gc = geo.gaussian_channels;
+        const size_t pair_floats = (size_t) 2 * geo.image_height * geo.image_width * gc;
+        std::vector<float> gbuf;
+        if (inputs.size() == 1 && ends_with(inputs[0], ".f32")) {
+            std::ifstream f(inputs[0], std::ios::binary | std::ios::ate);
+            if (!f) { std::fprintf(stderr, "cannot open %s\n", inputs[0].c_str()); free_splatter_free(ctx); return 1; }
+            const std::streamsize bytes = f.tellg(); f.seekg(0);
+            if ((size_t)(bytes / sizeof(float)) != pair_floats) {
+                std::fprintf(stderr, "dump %s: %zu floats, expected 2*%d*%d*%d\n", inputs[0].c_str(),
+                             (size_t)(bytes/sizeof(float)), geo.image_height, geo.image_width, gc);
+                free_splatter_free(ctx); return 1; }
+            gbuf.resize(pair_floats); f.read((char *) gbuf.data(), bytes);
+        } else if (inputs.size() == 2) {
+            std::vector<float> img;
+            for (const std::string & p : inputs)
+                if (!load_image_chw(p.c_str(), geo.image_width, img)) { free_splatter_free(ctx); return 1; }
+            float * out = nullptr; size_t n_out = 0;
+            if (free_splatter_run(ctx, img.data(), 2, geo.image_height, geo.image_width, &out, &n_out) != 0) {
+                std::fprintf(stderr, "run failed: %s\n", free_splatter_last_error(ctx)); free_splatter_free(ctx); return 1; }
+            gbuf.assign(out, out + n_out); free_splatter_buf_free(out);
+        } else {
+            std::fprintf(stderr, "--parallax needs exactly 2 images or one .f32 pair dump\n");
+            free_splatter_free(ctx); return 2;
+        }
+        free_splatter_parallax px;
+        if (free_splatter_pair_parallax(gbuf.data(), 2, geo.image_height, geo.image_width, gc, opac_thr, &px) != 0) {
+            std::fprintf(stderr, "parallax failed\n"); free_splatter_free(ctx); return 1; }
+        std::printf("parallax: tri_angle=%.3f deg  lateral_angle=%.2f deg  B/Z=%.4f  baseline=%.4f  median_depth=%.4f  focal=%.1f  npts=%d\n",
+                    px.tri_angle_deg, px.lateral_angle_deg, px.baseline_over_depth,
+                    px.baseline, px.median_depth, px.focal, px.n_points);
+        free_splatter_free(ctx);
+        return 0;
+    }
 
     // ---- accumulate mode: chain a photo stream into one world -----------------
     // Two input forms: a stream of IMAGES (the engine runs on each consecutive

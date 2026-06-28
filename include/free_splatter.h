@@ -93,6 +93,26 @@ FREE_SPLATTER_API int free_splatter_estimate_poses(
     int32_t gaussian_channels, float opacity_threshold,
     float * cam2world_out, float * focal_out);
 
+// After-inference parallax: how well a 2-view pair constrains depth, measured
+// from the model's OWN recovered geometry. Angles are scale-invariant.
+typedef struct {
+    float tri_angle_deg;       // median triangulation angle over confident points
+    float lateral_angle_deg;   // baseline angle off view-0 optical axis (0=dolly, 90=strafe)
+    float baseline_over_depth; // ||C1-C0|| / median point depth from camera 0
+    float baseline;
+    float median_depth;
+    float focal;               // estimated (or supplied) focal, px
+    int32_t n_points;          // confident points used for the medians
+} free_splatter_parallax;
+
+// Estimate parallax for the first two views of an engine output buffer.
+// gaussians: n_views(>=2)*height*width*gaussian_channels f32. Returns 0 on
+// success, -1 on bad args. A low tri_angle_deg (< ~1-2 deg) or near-zero
+// lateral_angle_deg means depth is ill-conditioned (reconstruction unreliable).
+FREE_SPLATTER_API int free_splatter_pair_parallax(
+    const float * gaussians, int32_t n_views, int32_t height, int32_t width,
+    int32_t gaussian_channels, float opacity_threshold, free_splatter_parallax * out);
+
 // One accumulated 3D gaussian in the global frame: position, color in [0,1], the
 // anisotropic scale and rotation quaternion (w,x,y,z) — transformed through the
 // cross-run Sim(3) so the cloud renders as oriented splats — and the source frame
