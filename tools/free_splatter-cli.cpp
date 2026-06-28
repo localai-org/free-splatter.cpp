@@ -127,6 +127,8 @@ static int usage(const char * a0) {
         "usage: %s [--device DEV] [--splat OUT.splat] [--out OUT.f32]\n"
         "          [--opacity-threshold T] [--max-splats N] [--dump-taps DIR]\n"
         "          MODEL.gguf (IMAGES... | INPUT.f32)\n"
+        "  --device defaults to GPU/vulkan and FAILS if none is present; pass\n"
+        "  --device cpu to run on CPU explicitly.\n"
         "\n"
         "accumulate mode (>=2 images -> one world from the photo stream):\n"
         "  %s --accumulate [--splat-prefix P] [--fuse] [--voxel V] [--fuse-k K]\n"
@@ -192,7 +194,12 @@ int main(int argc, char ** argv) {
     free_splatter_options_free(opts);
     if (!ctx) { std::fprintf(stderr, "load: out of memory\n"); return 1; }
     if (const char * err = free_splatter_last_error(ctx)) {
-        std::fprintf(stderr, "load failed: %s\n", err); free_splatter_free(ctx); return 1;
+        std::fprintf(stderr, "load failed: %s\n", err);
+        // Default device is GPU/Vulkan (fail-closed): if none was requested
+        // explicitly, point the user at the CPU opt-in instead of guessing.
+        if (!device) std::fprintf(stderr,
+            "  (no GPU device — pass --device cpu to run on CPU, or build with FREE_SPLATTER_VULKAN)\n");
+        free_splatter_free(ctx); return 1;
     }
 
     free_splatter_geometry geo;

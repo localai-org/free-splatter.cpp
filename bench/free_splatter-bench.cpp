@@ -88,7 +88,7 @@ int main(int argc, char ** argv) {
     }
 
     std::printf("model: %s  device=%s  %dx%d  in=%d  gc=%d  views=%d  S=%lld  load=%.1f ms\n",
-                model, device ? device : "cpu", geo.image_width, geo.image_height,
+                model, device ? device : "vulkan", geo.image_width, geo.image_height,
                 geo.in_channels, geo.gaussian_channels, views,
                 (long long) ((int64_t) views * (geo.image_height/8) * (geo.image_width/8)), load_ms);
 
@@ -124,7 +124,7 @@ int main(int argc, char ** argv) {
                 "(%.2f views/s, %.2f scenes/s)\n", mn, med, mean, mx, vps, 1000.0 / med);
     std::printf("RESULT engine device=%s views=%d gc=%d load_ms=%.1f min_ms=%.1f "
                 "median_ms=%.1f mean_ms=%.1f max_ms=%.1f views_per_s=%.3f\n",
-                device ? device : "cpu", views, geo.gaussian_channels, load_ms,
+                device ? device : "vulkan", views, geo.gaussian_channels, load_ms,
                 mn, med, mean, mx, vps);
     return 0;
 }

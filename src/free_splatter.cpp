@@ -92,7 +92,10 @@ free_splatter_ctx * free_splatter_load(const char * gguf_path, const free_splatt
     if (!ctx) return nullptr;
     if (opts) ctx->opts = opts->o;
 
-    if (!ctx->m.load(gguf_path, ctx->opts.device.empty() ? "cpu" : ctx->opts.device,
+    // Default to GPU and fail-closed: an unset/empty device resolves to vulkan, so
+    // a caller who never set one can't silently land on the (~50x slower) CPU path.
+    // CPU is opt-in only (explicit "cpu"). backend.cpp errors if no GPU is present.
+    if (!ctx->m.load(gguf_path, ctx->opts.device.empty() ? "vulkan" : ctx->opts.device,
                      ctx->opts.n_threads)) {
         ctx->error = ctx->m.error;
     }

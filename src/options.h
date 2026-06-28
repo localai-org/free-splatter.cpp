@@ -7,7 +7,7 @@
 namespace free_splatter {
 
 struct options {
-    std::string device       = "cpu";  // "" | cpu | gpu | cuda | vulkan [:N]
+    std::string device       = "vulkan";  // "" | cpu | gpu | cuda | vulkan [:N]; default GPU, fail-closed
     int         n_threads    = 0;       // <= 0 => auto (CPU)
     std::string dump_taps_dir;          // empty => tap dumping disabled
 };
