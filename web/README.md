@@ -49,27 +49,40 @@ consensus voxel (dense); `best` keeps only the most-confident frame per voxel
 (dense AND de-ghosted); `averaged` collapses each voxel to one denoised point
 (cleaner but sparse — only worthwhile with many overlapping frames).
 
-**De-ghosting.** Pairwise chaining leaves per-object misregistration, so
-overlapping frames show doubled objects. `--refine` (on by default in the bake;
-`REFINE=0` to disable) runs a gaussian-level consensus refinement that
-non-rigidly pulls each point toward the agreement of the other frames — ~5× less
-ghosting on real clips. (A rigid per-frame pose bundle-adjust does **not** help
-here: the residual is per-object reconstruction disagreement, not camera-pose
-error.)
+**De-ghosting.** Pairwise chaining overlays each frame's reconstruction in world
+space, so where two frames disagree about a surface you see doubled ("ghosted")
+copies. The fused step removes them by **best-frame selection** (`--fuse-mode
+best`): within each voxel it keeps only the single most-confident frame's
+gaussians, so disagreeing copies aren't stacked — one frame represents each
+region. This de-ghosts by *selection* (no averaging → no blur), at the cost of
+visible seams where adjacent voxels pick different frames. The two artifact-free
+alternatives are more expensive: fixing the registration (only helps when the
+disagreement is a *rigid* pose drift — usually it isn't, it's per-pair stereo
+depth disagreement baked into the network output, which no rigid alignment can
+undo) or photometric 3DGS re-optimization. A gaussian-level averaging pass
+(`--refine`, **off** by default) exists but is **not recommended**: it averages
+points that already share a voxel — blurring the in-register surface — while
+leaving ghosts that are more than a voxel apart untouched, so it trades sharpness
+for no real de-ghosting.
 
 **Pick frames with lateral baseline.** Two-view depth needs the camera to
 *translate sideways* — a pure forward dolly (the camera moving along the direction
 it faces) gives near-zero parallax and reconstructs blurry. Frames a few apart
 from an orbiting / strafing clip work far better than tightly-spaced frames of a
 walk-forward clip. Rule of thumb: the per-pair lateral baseline should be a few %
-of scene depth or more (`scripts/` had a `baseline` probe in git history).
+of scene depth or more.
 
-**Pick frames with lateral baseline.** Two-view depth needs the camera to
-*translate sideways* — a pure forward dolly (the camera moving along the direction
-it faces) gives near-zero parallax and reconstructs blurry. Frames a few apart
-from an orbiting / strafing clip work far better than tightly-spaced frames of a
-walk-forward clip. Rule of thumb: the per-pair lateral baseline should be a few %
-of scene depth or more (`scripts/` had a `baseline` probe in git history).
+**…or let the gate pick them (`MIN_PARALLAX`).** The bake passes
+`--min-parallax DEG` (default 8°, `MIN_PARALLAX=0` to disable): a candidate frame
+is folded in only if its triangulation angle vs the last *kept* frame clears the
+threshold — otherwise its depth is ill-conditioned and the model invents it.
+Skipped frames re-anchor against the last kept one (keyframe selection), so you can
+feed a long, dense frame stream and let the gate curate the well-conditioned
+subset. The threshold is the engine's *after-inference* angle
+(`free_splatter-cli --parallax …`), which over-reports, so keep it well above
+COLMAP's 1–2°. `scripts/parallax_ref.py` (cv2, dev-shell only) is the independent
+geometric cross-check — agreement on a pair validates it; a large gap (geometric
+angle tiny, model angle confident) flags the model hallucinating depth.
 
 ## Sanity-checking the data separately
 

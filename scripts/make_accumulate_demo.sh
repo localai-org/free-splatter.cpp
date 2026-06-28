@@ -29,29 +29,46 @@ for i in "${!FRAMES[@]}"; do
 done
 
 # 2) accumulate: one engine pass over the stream writes acc_2.splat, acc_3.splat,
-#    ... (the cloud after each photo is folded in) + acc_fused.splat (the
-#    consensus surface: voxels seen by >= K frames, single-view floaters removed).
-#    --refine geometrically de-ghosts each step (pulls overlapping frames together);
-#    set REFINE=0 to disable.
-RFLAG=; [ "${REFINE:-1}" = 1 ] && RFLAG=--refine
-"$CLI" --device "$DEVICE" --accumulate $RFLAG --fuse --splat-prefix "$OUT/acc" \
-  --max-splats "$MAXSPLATS" "$MODEL" "${FRAMES[@]}"
+#    ... (the cloud after each KEPT photo) + a best-frame consensus acc_fused.splat.
+#    --min-parallax gates by keyframe: a candidate frame is folded in only if its
+#    triangulation angle vs the last KEPT frame clears MIN_PARALLAX deg (else its
+#    depth is ill-conditioned and the model would invent it); skipped frames re-
+#    anchor against the last kept one. This is the after-inference angle, which the
+#    model over-reports, so keep it well above COLMAP's 1-2 deg. MIN_PARALLAX=0
+#    folds in every frame. --refine (OFF) is the gaussian averaging pass (blurs).
+RFLAG=; [ "${REFINE:-0}" = 1 ] && RFLAG=--refine
+MINPAR=${MIN_PARALLAX:-8}
+PFLAG=; [ "$MINPAR" != "0" ] && PFLAG="--min-parallax $MINPAR"
+LOG="$OUT/accumulate.log"
+"$CLI" --device "$DEVICE" --accumulate $RFLAG $PFLAG --fuse --fuse-mode best \
+  --splat-prefix "$OUT/acc" --max-splats "$MAXSPLATS" "$MODEL" "${FRAMES[@]}" | tee "$LOG"
 
-# 3) manifest.json: one step per added photo (acc_n.splat + the n thumbnails, the
-#    last being the one just added), then a final consensus-fused step.
-n=${#FRAMES[@]}
-allimgs=""
-for ((j=0;j<n;j++)); do allimgs+="\"view_$j.jpg\""; [ $j -lt $((n-1)) ] && allimgs+=", "; done
+# 3) manifest.json: one step per KEPT photo (acc_n.splat + its n kept thumbnails),
+#    then the consensus-fused step. With gating only the frames that carried enough
+#    parallax are kept: frame 0 is the anchor and each "keep frame J" line adds
+#    input frame J. Ungated (MIN_PARALLAX=0), every frame is kept.
+if [ -z "$PFLAG" ]; then
+  kept=(); for i in "${!FRAMES[@]}"; do kept+=("$i"); done
+else
+  kept=(0)
+  while read -r j; do kept+=("$j"); done < <(grep -oP '^keep frame \K[0-9]+' "$LOG")
+fi
+nkept=${#kept[@]}
+[ "$nkept" -ge 2 ] || { echo "only $nkept frame(s) kept (MIN_PARALLAX=$MINPAR too high?)" >&2; exit 1; }
+thumb() { printf '"view_%s.jpg"' "$1"; }       # thumbnail referenced by original index
 {
   echo '{ "steps": ['
-  for ((k=2;k<=n;k++)); do
+  for ((k=2;k<=nkept;k++)); do
     imgs=""
-    for ((j=0;j<k;j++)); do imgs+="\"view_$j.jpg\""; [ $j -lt $((k-1)) ] && imgs+=", "; done
+    for ((j=0;j<k;j++)); do imgs+="$(thumb "${kept[$j]}")"; [ $j -lt $((k-1)) ] && imgs+=", "; done
     printf '    {"splat":"acc_%d.splat","images":[%s],"n":%d},\n' "$k" "$imgs" "$k"
   done
-  printf '    {"splat":"acc_fused.splat","images":[%s],"n":%d,"label":"consensus-fused — single-view floaters removed"}\n' "$allimgs" "$n"
+  allimgs=""
+  for ((j=0;j<nkept;j++)); do allimgs+="$(thumb "${kept[$j]}")"; [ $j -lt $((nkept-1)) ] && allimgs+=", "; done
+  printf '    {"splat":"acc_fused.splat","images":[%s],"n":%d,"label":"consensus-fused — best-frame, parallax-gated"}\n' "$allimgs" "$nkept"
   echo '  ] }'
 } > "$OUT/manifest.json"
+echo "kept frames (input indices): ${kept[*]}  of ${#FRAMES[@]}"
 
 # 4) the viewer, self-contained next to its assets
 cp "$ROOT/web/accumulate.html" "$OUT/index.html"
