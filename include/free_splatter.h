@@ -171,6 +171,38 @@ FREE_SPLATTER_API int free_splatter_refine_cloud(
 FREE_SPLATTER_API int free_splatter_accumulator_refine(
     free_splatter_accumulator * acc, float voxel_frac, int32_t iters, float alpha);
 
+// Consensus-fuse an arbitrary point cloud (e.g. a tree root) using each point's
+// `frame` tag: keep voxels (size voxel_frac*extent) seen by >= k distinct frames,
+// emitting per `mode` (0 averaged, 1 kept, 2 best-frame — dense AND de-ghosted).
+// *out malloc'd (free with free_splatter_buf_free). Returns 0 on success.
+FREE_SPLATTER_API int free_splatter_fuse_cloud(
+    const free_splatter_point * pts, size_t n, float voxel_frac, int32_t k, int32_t mode,
+    free_splatter_point ** out, size_t * n_out);
+
+// Hierarchical (balanced binary tree) accumulation — batch alternative to the
+// linear accumulator. pairs[k] is one engine output [2*H*W*gc] (pair k = frames
+// k,k+1; pair k's view-1 and pair k+1's view-0 are the same frame). Adjacent
+// submaps of `block` frames overlap by `overlap` frames, and each merge fits its
+// Sim(3) over all shared frames at once (over-determined -> averages per-frame
+// noise) — so drift compounds over ~log2(N) hops, not N, and is spread evenly
+// instead of dumped on the last frame. block=2,overlap=1 is the plain
+// overlap-by-one (single shared boundary) tree.
+//
+// The remaining args are for visualising the merge side by side (pass max_levels=-1,
+// layout_spacing=0, per_node_cap=0, n_nodes=NULL for a plain full merge to the root):
+// max_levels stops after that many rounds (-1 = full), so 0 returns the independent
+// base submaps, 1 the first merge round, …; step 0..D to watch the tree collapse to
+// one scene. The remaining nodes are laid out side by side (layout_spacing: 0 = none,
+// <0 = auto, >0 = explicit units) and each capped to its most important
+// (opacity*radius) points (per_node_cap>0) so every scene renders at its own detail.
+// *n_nodes (optional) gets the remaining node count (1 once fully merged). *out
+// malloc'd as free_splatter_point[*n_out] (free with free_splatter_buf_free). 0 on success.
+FREE_SPLATTER_API int free_splatter_tree_overlap(
+    const float * const * pairs, int32_t n_pairs, int32_t gaussian_channels,
+    int32_t height, int32_t width, float opacity_threshold, int32_t block, int32_t overlap,
+    int32_t max_levels, float layout_spacing, int32_t per_node_cap,
+    free_splatter_point ** out, size_t * n_out, int32_t * n_nodes);
+
 #ifdef __cplusplus
 }
 #endif

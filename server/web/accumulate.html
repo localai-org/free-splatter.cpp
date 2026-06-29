@@ -91,6 +91,9 @@
   <div class="stat"><span>fps</span><span id="s-fps">—</span></div>
   <div id="status">starting…</div>
   <div id="ctl"><button id="prev">‹ prev</button><button id="play">⏸ pause</button><button id="next">next ›</button></div>
+  <label id="vibrow" style="display:flex;align-items:center;gap:8px;font-size:11.5px;color:#8b93a1;margin-top:10px;">
+    <span>vibrance</span><input id="vibrance" type="range" min="0.6" max="2.2" step="0.05" value="1.45" style="flex:1;accent-color:#6f9bff"/>
+  </label>
   <div id="server-ui">
     <div class="srow"><label>scene</label><select id="scene-sel"></select></div>
     <div class="up">
@@ -184,13 +187,19 @@ void main() {
 }`;
 const FRAG = `#version 300 es
 precision highp float;
+uniform float u_sat;     // saturation/vibrance boost (1.0 = as-decoded)
 in vec4 v_color; in vec2 v_pos;
 out vec4 o;
 void main() {
   float p = -dot(v_pos, v_pos);
   if (p < -4.0) discard;
   float alpha = exp(p) * v_color.a;
-  o = vec4(v_color.rgb * alpha, alpha);
+  // SH-DC-only color is flat/desaturated; push each splat's color away from its
+  // luma before the premultiplied blend (the blend itself also greys overlaps).
+  vec3 rgb = v_color.rgb;
+  float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+  rgb = clamp(mix(vec3(luma), rgb, u_sat), 0.0, 1.0);
+  o = vec4(rgb * alpha, alpha);
 }`;
 function shader(type, src){ const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
   if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
@@ -212,6 +221,7 @@ const TEX_W = 2048;
 const U = {
   proj: gl.getUniformLocation(prog,"u_proj"), view: gl.getUniformLocation(prog,"u_view"),
   focal: gl.getUniformLocation(prog,"u_focal"), viewport: gl.getUniformLocation(prog,"u_viewport"),
+  sat: gl.getUniformLocation(prog,"u_sat"),
 };
 gl.uniform1i(gl.getUniformLocation(prog,"u_tex"), 0);
 gl.disable(gl.DEPTH_TEST);
@@ -312,6 +322,12 @@ const norm=(a)=>{const l=Math.hypot(...a)||1;return [a[0]/l,a[1]/l,a[2]/l];};
 function resize(){ const dpr=Math.min(devicePixelRatio,2); canvas.width=innerWidth*dpr; canvas.height=innerHeight*dpr; gl.viewport(0,0,canvas.width,canvas.height); }
 addEventListener("resize", resize); resize();
 
+// vibrance (saturation) — cosmetic, demo-layer only; ?sat= overrides so headless/
+// video renders match what you dialed in. Same control as reconstruct.html.
+let saturation = parseFloat(_q.get("sat") ?? "1.45");
+{ const vib = $("vibrance"); vib.value = saturation;
+  vib.addEventListener("input", e => { saturation = +e.target.value; }); }
+
 let frames=0, fpsT=performance.now(), lastT=performance.now();
 function render(){
   const now=performance.now(), dt=(now-lastT)/1000; lastT=now;
@@ -326,6 +342,7 @@ function render(){
   gl.useProgram(prog);
   gl.uniformMatrix4fv(U.view,false,view); gl.uniformMatrix4fv(U.proj,false,proj);
   gl.uniform2f(U.focal,fx,fy); gl.uniform2f(U.viewport,canvas.width,canvas.height);
+  gl.uniform1f(U.sat, saturation);
   gl.bindBuffer(gl.ARRAY_BUFFER,quadBuf); gl.enableVertexAttribArray(aCorner); gl.vertexAttribPointer(aCorner,2,gl.FLOAT,false,0,0);
   if(sortedCount>0){
     gl.bindBuffer(gl.ARRAY_BUFFER,idxBuf); gl.enableVertexAttribArray(aIndex);
@@ -363,7 +380,9 @@ async function loadStep(i){
     if(!resp.ok) throw new Error("HTTP "+resp.status+" for "+step.splat);
     const bytes = new Uint8Array(await resp.arrayBuffer());
     setSplat(bytes);
-    if(!framed) frameToData(0.9);                    // frame once; camera stays as it grows
+    // frame once (camera stays put as the cloud grows); but a tree-stages manifest
+    // sets "reframe":true so each stage (very different extents) refits the view.
+    if(!framed || (manifest && manifest.reframe)) frameToData(0.9);
     if (step.label) {
       banner.innerHTML = `<b>✓ ${step.label}</b> · ${count.toLocaleString()} splats`;
       setStatus(`${step.label} · ${count.toLocaleString()} splats`);
