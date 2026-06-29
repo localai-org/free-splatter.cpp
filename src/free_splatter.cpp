@@ -5,6 +5,8 @@
 #include "options.h"
 #include "pose.h"
 
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -261,7 +263,20 @@ int free_splatter_accumulator_add_pair(free_splatter_accumulator * acc, const fl
                                        int32_t gaussian_channels) {
     if (!acc || !gaussians || gaussian_channels < 16) return -1;
     acc->gc = gaussian_channels;
-    acc->acc.add_pair(gaussians, gaussian_channels);
+    const free_splatter::pose::ChainLink link = acc->acc.add_pair(gaussians, gaussian_channels);
+    if (std::getenv("FREE_SPLATTER_DEBUG_LINKS")) {
+        // Surface the per-link registration diagnostics + the COMPOUNDED global drift
+        // (open-loop chain T_k = T_{k-1}.sim, so per-link error accumulates).
+        const auto & g = link.global;
+        const double tn = std::sqrt(g.t[0]*g.t[0] + g.t[1]*g.t[1] + g.t[2]*g.t[2]);
+        double c = (g.R(0,0) + g.R(1,1) + g.R(2,2) - 1.0) * 0.5;
+        c = c > 1.0 ? 1.0 : (c < -1.0 ? -1.0 : c);
+        std::fprintf(stderr,
+            "[link] pair=%d  local: s=%.4f inlier=%.3f valid=%.3f resid=%.4f | "
+            "global: s=%.4f rot=%.2fdeg |t|=%.4f\n",
+            acc->acc.pair_count(), link.sim.s, link.inlier_frac, link.valid_frac,
+            link.resid_frac, g.s, std::acos(c) * 57.29577951308232, tn);
+    }
     return 0;
 }
 
@@ -304,6 +319,51 @@ int free_splatter_accumulator_refine(free_splatter_accumulator * acc, float voxe
     if (!acc || !(voxel_frac > 0) || iters < 1) return -1;
     acc->acc.refine(voxel_frac, iters, alpha);
     return 0;
+}
+
+int free_splatter_fuse_cloud(const free_splatter_point * pts, size_t n, float voxel_frac,
+                             int32_t k, int32_t mode, free_splatter_point ** out, size_t * n_out) {
+    if (out) *out = nullptr;
+    if (n_out) *n_out = 0;
+    if (!pts || !out || !n_out || k < 1 || !(voxel_frac > 0)) return -1;
+    std::vector<free_splatter::pose::AccumPoint> cloud(n);
+    for (size_t i = 0; i < n; i++) {
+        const free_splatter_point & p = pts[i]; free_splatter::pose::AccumPoint & a = cloud[i];
+        a.x = p.x; a.y = p.y; a.z = p.z; a.r = p.r; a.g = p.g; a.b = p.b; a.opacity = p.opacity;
+        a.sx = p.sx; a.sy = p.sy; a.sz = p.sz; a.qw = p.qw; a.qx = p.qx; a.qy = p.qy; a.qz = p.qz;
+        a.frame = p.frame;
+    }
+    std::vector<free_splatter::pose::AccumPoint> fused;
+    free_splatter::pose::consensus_fuse(cloud, voxel_frac, k, fused, mode);
+    return emit_points(fused, out, n_out);
+}
+
+int free_splatter_tree_overlap(const float * const * pairs, int32_t n_pairs, int32_t gaussian_channels,
+                               int32_t height, int32_t width, float opacity_threshold,
+                               int32_t block, int32_t overlap,
+                               int32_t max_levels, float layout_spacing, int32_t per_node_cap,
+                               free_splatter_point ** out, size_t * n_out, int32_t * n_nodes) {
+    if (out) *out = nullptr;
+    if (n_out) *n_out = 0;
+    if (n_nodes) *n_nodes = 0;
+    if (!pairs || n_pairs < 1 || gaussian_channels < 16 || height < 1 || width < 1 || !out || !n_out)
+        return -1;
+    for (int32_t i = 0; i < n_pairs; i++) if (!pairs[i]) return -1;
+    std::vector<const float *> ps(pairs, pairs + n_pairs);
+    std::vector<free_splatter::pose::TreeMerge> merges;
+    int nn = 0;
+    std::vector<free_splatter::pose::AccumPoint> cloud =
+        free_splatter::pose::tree_accumulate_overlap(ps, height, width, gaussian_channels, opacity_threshold,
+                                                     block, overlap, 0.02, 300, 0, &merges,
+                                                     max_levels, layout_spacing, &nn, per_node_cap);
+    if (n_nodes) *n_nodes = nn;
+    if (std::getenv("FREE_SPLATTER_DEBUG_LINKS"))
+        for (const auto & m : merges)
+            std::fprintf(stderr,
+                "[tree] L%d range[%d..%d] sharedframes=%d  s=%.4f inlier=%.3f valid=%.3f resid=%.4f\n",
+                m.level, m.lo_frame, m.hi_frame, m.shared_frame,
+                m.scale, m.inlier_frac, m.valid_frac, m.resid_frac);
+    return emit_points(cloud, out, n_out);
 }
 
 int free_splatter_accumulator_camera_path(const free_splatter_accumulator * acc,

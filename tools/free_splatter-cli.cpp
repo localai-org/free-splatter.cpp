@@ -151,7 +151,8 @@ int main(int argc, char ** argv) {
     const char * model = nullptr, * splat_prefix = nullptr;
     float opac_thr = 5e-3f;
     long  max_splats = 0;
-    bool  accumulate = false, fuse = false, parallax = false;
+    bool  accumulate = false, fuse = false, parallax = false, tree = false, tree_stages = false;
+    int   tov_block = 4, tov_overlap = 2;        // tree: submap width / shared frames (2/1 = overlap-by-one)
     int   fuse_mode = 1;                         // 0 averaged, 1 kept, 2 best-frame
     float voxel = 0.02f, splat_scale = 1.0f;   // multiplier on the predicted gaussian radii
     int   fuse_k = 2;
@@ -168,6 +169,10 @@ int main(int argc, char ** argv) {
         else if (a == "--opacity-threshold" && i+1<argc) opac_thr = (float) atof(argv[++i]);
         else if (a == "--max-splats" && i+1 < argc)     max_splats = atol(argv[++i]);
         else if (a == "--accumulate")                   accumulate = true;
+        else if (a == "--accumulate-tree")            { accumulate = true; tree = true; }
+        else if (a == "--tree-stages")                { accumulate = true; tree_stages = true; }
+        else if (a == "--tree-block" && i+1 < argc)     tov_block = atoi(argv[++i]);
+        else if (a == "--tree-overlap" && i+1 < argc)   tov_overlap = atoi(argv[++i]);
         else if (a == "--parallax")                     parallax = true;
         else if (a == "--splat-prefix" && i+1 < argc)   splat_prefix = argv[++i];
         else if (a == "--fuse")                         fuse = true;
@@ -272,6 +277,10 @@ int main(int argc, char ** argv) {
         free_splatter_accumulator * acc = free_splatter_accumulator_new(sz, sz, opac_thr);
         if (!acc) { std::fprintf(stderr, "accumulator alloc failed\n"); free_splatter_free(ctx); return 1; }
 
+        // --accumulate-tree: collect the (gated) pair engine outputs and merge them
+        // up a balanced binary tree instead of chaining linearly (less compounded drift).
+        std::vector<std::vector<float>> tree_pairs;
+
         // emit the accumulated cloud after a pair is folded in (optional de-ghost)
         auto emit_step = [&](int nframes) {
             if (!splat_prefix) return;
@@ -300,6 +309,7 @@ int main(int argc, char ** argv) {
                                  (size_t)(bytes/sizeof(float)), sz, sz, gc);
                     free_splatter_accumulator_free(acc); free_splatter_free(ctx); return 1; }
                 std::vector<float> dumpbuf(pair_floats); f.read((char *) dumpbuf.data(), bytes);
+                if (tree || tree_stages) { tree_pairs.push_back(std::move(dumpbuf)); std::printf("pair %zu collected\n", k); continue; }
                 free_splatter_accumulator_add_pair(acc, dumpbuf.data(), gc);
                 const int nframes = free_splatter_accumulator_frame_count(acc);
                 std::printf("pair %zu -> %d frames\n", k, nframes);
@@ -329,6 +339,12 @@ int main(int argc, char ** argv) {
                     }
                     std::printf("keep frame %zu: parallax %.1f deg (vs kept frame %zu)\n", j, px.tri_angle_deg, last_kept);
                 }
+                if (tree || tree_stages) {
+                    tree_pairs.emplace_back(runout, runout + ng);
+                    free_splatter_buf_free(runout);
+                    std::printf("pair (%zu,%zu) collected\n", last_kept, j);
+                    last_kept = j; continue;
+                }
                 free_splatter_accumulator_add_pair(acc, runout, gc);
                 free_splatter_buf_free(runout);
                 const int nframes = free_splatter_accumulator_frame_count(acc);
@@ -337,6 +353,92 @@ int main(int argc, char ** argv) {
                 last_kept = j;
             }
             if (skipped) std::printf("gated: skipped %d low-parallax frame(s)\n", skipped);
+        }
+        if (tree || tree_stages) {
+            std::vector<const float *> ps; ps.reserve(tree_pairs.size());
+            for (auto & v : tree_pairs) ps.push_back(v.data());
+            if (ps.empty()) { std::fprintf(stderr, "tree: need >=1 pair\n");
+                free_splatter_accumulator_free(acc); free_splatter_free(ctx); return 1; }
+            const std::string pfx = splat_prefix ? splat_prefix : "stage";
+
+            if (tree_stages) {
+                // write one laid-out .splat per merge level (stage 0 = the independent
+                // leaf scenes side by side, ... then the single merged world, then a
+                // consensus-fused clean scene) + a manifest the viewer steps through.
+                std::string dir = ".", base = pfx;
+                const size_t slash = pfx.find_last_of('/');
+                if (slash != std::string::npos) { dir = pfx.substr(0, slash); base = pfx.substr(slash + 1); }
+                // per-scene budget: each laid-out scene keeps its own detail (a single
+                // shared cap would starve every scene to ~1/N and fill it with floaters).
+                const int per_node = (max_splats > 0 && max_splats < 200000) ? (int) max_splats : 150000;
+                std::vector<std::string> labels;
+                auto stage_path = [&](char * p, size_t cap) { std::snprintf(p, cap, "%s_%zu.splat", pfx.c_str(), labels.size()); };
+                // multi-scene stages of the multi-frame-overlap tree: each laid-out
+                // scene gets its own per_node budget.
+                for (int L = 0; L <= 64; L++) {
+                    free_splatter_point * sc = nullptr; size_t nsc = 0; int nnodes = 0;
+                    if (free_splatter_tree_overlap(ps.data(), (int) ps.size(), gc, sz, sz,
+                            opac_thr, tov_block, tov_overlap, L, -1.0f /*auto layout*/, per_node, &sc, &nsc, &nnodes) != 0) {
+                        std::fprintf(stderr, "tree-stages failed at level %d\n", L);
+                        free_splatter_accumulator_free(acc); free_splatter_free(ctx); return 1; }
+                    if (nnodes <= 1) { free_splatter_buf_free(sc); break; }   // single scene: full budget below
+                    char path[1024]; stage_path(path, sizeof path);
+                    write_cloud_splat(sc, nsc, 0 /*already per-node capped*/, splat_scale, path);
+                    free_splatter_buf_free(sc);
+                    std::printf("stage %zu: %d scenes\n", labels.size(), nnodes);
+                    labels.push_back(L == 0 ? (std::to_string(nnodes) + " independent scenes")
+                                   : ("merge " + std::to_string(L) + " — " + std::to_string(nnodes) + " scenes"));
+                }
+                // the single merged world, at full budget: first the raw union (the
+                // overlapping per-frame copies, ghosted), then the consensus-fused
+                // (best-frame) clean scene — same contrast as the linear demo's acc/fused.
+                free_splatter_point * root = nullptr; size_t nroot = 0;
+                if (free_splatter_tree_overlap(ps.data(), (int) ps.size(), gc, sz, sz, opac_thr,
+                                               tov_block, tov_overlap, -1, 0.0f, 0, &root, &nroot, nullptr) == 0) {
+                    char path[1024]; stage_path(path, sizeof path);
+                    write_cloud_splat(root, nroot, (size_t) max_splats, splat_scale, path);
+                    std::printf("stage %zu: merged raw union (%zu pts)\n", labels.size(), nroot);
+                    labels.push_back("merged — one scene (raw union)");
+                    free_splatter_point * fz = nullptr; size_t nfz = 0;
+                    if (free_splatter_fuse_cloud(root, nroot, voxel, fuse_k, 2 /*best-frame*/, &fz, &nfz) == 0 && nfz > 0) {
+                        char path2[1024]; stage_path(path2, sizeof path2);
+                        write_cloud_splat(fz, nfz, (size_t) max_splats, splat_scale, path2);
+                        std::printf("stage %zu: consensus-fused (%zu -> %zu pts)\n", labels.size(), nroot, nfz);
+                        labels.push_back("consensus-fused — one clean scene");
+                        free_splatter_buf_free(fz);
+                    }
+                    free_splatter_buf_free(root);
+                }
+                std::ofstream mf(dir + "/manifest.json");
+                mf << "{ \"reframe\": true, \"steps\": [\n";
+                for (size_t L = 0; L < labels.size(); L++)
+                    mf << "    {\"splat\":\"" << base << "_" << L << ".splat\",\"images\":[],\"n\":" << (L + 1)
+                       << ",\"label\":\"" << labels[L] << "\"}" << (L + 1 < labels.size() ? "," : "") << "\n";
+                mf << "  ] }\n";
+                std::printf("tree-stages: %zu stages -> %s/manifest.json\n", labels.size(), dir.c_str());
+            } else {
+                // one merged world from the overlap tree (block=tov_block, overlap=tov_overlap;
+                // 2/1 = the plain overlap-by-one tree). With --fuse, also the de-ghosted scene.
+                std::printf("tree-accumulate: %zu pairs, block=%d overlap=%d\n", ps.size(), tov_block, tov_overlap);
+                free_splatter_point * tc = nullptr; size_t ntc = 0;
+                if (free_splatter_tree_overlap(ps.data(), (int) ps.size(), gc, sz, sz, opac_thr,
+                                               tov_block, tov_overlap, -1, 0.0f, 0, &tc, &ntc, nullptr) != 0) {
+                    std::fprintf(stderr, "tree accumulate failed\n");
+                    free_splatter_accumulator_free(acc); free_splatter_free(ctx); return 1; }
+                char path[1024];
+                std::snprintf(path, sizeof path, "%s_tree.splat", pfx.c_str());
+                write_cloud_splat(tc, ntc, (size_t) max_splats, splat_scale, path);
+                if (fuse) {                                  // best-frame consensus, de-ghosted
+                    free_splatter_point * fz = nullptr; size_t nfz = 0;
+                    if (free_splatter_fuse_cloud(tc, ntc, voxel, fuse_k, 2, &fz, &nfz) == 0 && nfz > 0) {
+                        std::snprintf(path, sizeof path, "%s_tree_fused.splat", pfx.c_str());
+                        write_cloud_splat(fz, nfz, (size_t) max_splats, splat_scale, path);
+                        free_splatter_buf_free(fz);
+                    }
+                }
+                free_splatter_buf_free(tc);
+            }
+            free_splatter_accumulator_free(acc); free_splatter_free(ctx); return 0;
         }
         if (fuse && splat_prefix) {
             if (refine) free_splatter_accumulator_refine(acc, refine_voxel, refine_iters, refine_alpha);

@@ -1078,6 +1078,226 @@ std::vector<Mat4> Accumulator::camera_path() const {
     return path;
 }
 
+// ---- hierarchical tree accumulation ---------------------------------------
+
+// One gaussian (gc-channel engine layout) -> AccumPoint at identity (leaf frame).
+static AccumPoint tree_leaf_point(const float * a, int frame) {
+    AccumPoint p;
+    p.x = a[0]; p.y = a[1]; p.z = a[2];
+    p.r = clamp01((float) (a[3] * SH_C0 + 0.5));
+    p.g = clamp01((float) (a[4] * SH_C0 + 0.5));
+    p.b = clamp01((float) (a[5] * SH_C0 + 0.5));
+    p.opacity = a[15];
+    p.sx = a[16]; p.sy = a[17]; p.sz = a[18];
+    std::array<double,4> q = quat_normalize({ a[19], a[20], a[21], a[22] });
+    p.qw = (float) q[0]; p.qx = (float) q[1]; p.qy = (float) q[2]; p.qz = (float) q[3];
+    p.frame = frame;
+    return p;
+}
+
+// Apply a Sim(3) to a whole cloud (position s*(R@x)+t, scale *s, orientation qS⊗q).
+static void tree_apply_sim_cloud(std::vector<AccumPoint> & c, const Sim3 & S) {
+    const std::array<double,4> qS = mat3_to_quat(S.R);
+    for (auto & p : c) {
+        Vec3 w = sim_apply(S, { p.x, p.y, p.z });
+        p.x = (float) w[0]; p.y = (float) w[1]; p.z = (float) w[2];
+        p.sx = (float) (S.s * p.sx); p.sy = (float) (S.s * p.sy); p.sz = (float) (S.s * p.sz);
+        std::array<double,4> q = quat_normalize(quat_mul(qS, { p.qw, p.qx, p.qy, p.qz }));
+        p.qw = (float) q[0]; p.qx = (float) q[1]; p.qy = (float) q[2]; p.qz = (float) q[3];
+    }
+}
+static void tree_apply_sim_pts(std::vector<float> & pts, const Sim3 & S) {
+    for (size_t i = 0; i + 3 <= pts.size(); i += 3) {
+        Vec3 w = sim_apply(S, { pts[i], pts[i+1], pts[i+2] });
+        pts[i] = (float) w[0]; pts[i+1] = (float) w[1]; pts[i+2] = (float) w[2];
+    }
+}
+
+// Robustly register one band of shared-frame correspondences (XA -> XB, both flat
+// 3*n): RANSAC similarity at a scene-relative threshold, plus the inlier residual.
+// The single registration primitive for both tree merges (caller derives the
+// inlier/valid fractions, which it normalises differently per tree).
+struct BandFit { Sim3 S; int n_inl; double scene; double resid; };
+static BandFit fit_band_sim(const std::vector<double> & XA, const std::vector<double> & XB,
+                            double rthr, int riters, uint64_t seed) {
+    const int n = (int) (XA.size() / 3);
+    BandFit f{ sim_identity(), 0, 0.0, 0.0 };
+    if (n < 3) return f;
+    double mB[3]; mean3(XB.data(), n, mB);
+    std::vector<double> yc(3 * n);
+    for (int k = 0; k < n; k++) for (int c = 0; c < 3; c++) yc[3*k+c] = XB[3*k+c] - mB[c];
+    f.scene = rms3(yc.data(), n);
+    std::vector<char> inl;
+    f.S = fit_similarity_ransac(XA.data(), XB.data(), n, rthr * f.scene, riters, inl, true, seed);
+    std::vector<double> rA;
+    for (int k = 0; k < n; k++) if (inl[k]) {
+        f.n_inl++;
+        Vec3 sa = sim_apply(f.S, { XA[3*k], XA[3*k+1], XA[3*k+2] });
+        for (int c = 0; c < 3; c++) rA.push_back(sa[c] - XB[3*k+c]);
+    }
+    f.resid = (f.scene > 0 && f.n_inl > 0) ? rms3(rA.data(), f.n_inl) / f.scene : 0.0;
+    return f;
+}
+
+// ---- multi-frame-overlap tree ---------------------------------------------
+
+// A submap covering a contiguous global frame range, carrying the per-pixel point
+// arrays of every frame it spans (in the submap's local frame) so a neighbour can
+// align on the whole band of frames they share, not just one.
+struct ONode {
+    std::vector<AccumPoint> cloud;
+    int lo, hi;                              // inclusive global frame range
+    std::vector<std::vector<float>> fpts;    // [f-lo] -> P*3 per-pixel points
+    std::vector<std::vector<char>>  fmsk;    // [f-lo] -> P opacity mask
+};
+
+// One pair (frames a, a+1) as a 2-frame submap (identity local frame).
+static ONode opair(const float * g, int a, int P, int gc, double thr) {
+    ONode nd; nd.lo = a; nd.hi = a + 1;
+    nd.fpts.assign(2, {}); nd.fmsk.assign(2, {});
+    nd.fpts[0].resize(3*P); nd.fpts[1].resize(3*P);
+    nd.fmsk[0].assign(P, 0); nd.fmsk[1].assign(P, 0);
+    nd.cloud.reserve(2*P);
+    for (int i = 0; i < P; i++) {
+        const float * a0 = g + (size_t) i * gc;
+        const float * a1 = g + (size_t) (P + i) * gc;
+        for (int c = 0; c < 3; c++) { nd.fpts[0][3*i+c] = a0[c]; nd.fpts[1][3*i+c] = a1[c]; }
+        nd.fmsk[0][i] = (a0[15] > thr) ? 1 : 0;
+        nd.fmsk[1][i] = (a1[15] > thr) ? 1 : 0;
+        if (a0[15] > thr) nd.cloud.push_back(tree_leaf_point(a0, a));
+        if (a1[15] > thr) nd.cloud.push_back(tree_leaf_point(a1, a + 1));
+    }
+    return nd;
+}
+
+// Merge R into L's frame, fitting one Sim(3) over EVERY frame they share. Returns
+// the combined submap; optionally records the merge diagnostics.
+static ONode omerge(ONode & L, ONode & R, int P, double rthr, int riters, uint64_t seed,
+                    std::vector<TreeMerge> * merges, int level) {
+    const int so = std::max(L.lo, R.lo), sh = std::min(L.hi, R.hi);   // shared frame range
+    std::vector<double> XA, XB;
+    for (int f = so; f <= sh; f++) {
+        const std::vector<float> & ra = R.fpts[f - R.lo]; const std::vector<char> & rm = R.fmsk[f - R.lo];
+        const std::vector<float> & la = L.fpts[f - L.lo]; const std::vector<char> & lm = L.fmsk[f - L.lo];
+        for (int i = 0; i < P; i++) if (rm[i] && lm[i]) {
+            XA.push_back(ra[3*i]); XA.push_back(ra[3*i+1]); XA.push_back(ra[3*i+2]);
+            XB.push_back(la[3*i]); XB.push_back(la[3*i+1]); XB.push_back(la[3*i+2]);
+        }
+    }
+    const int n = (int) (XA.size() / 3);
+    const int shared = sh - so + 1;
+    BandFit fit = fit_band_sim(XA, XB, rthr, riters, seed);
+    const Sim3 & S = fit.S;
+    if (merges) merges->push_back(TreeMerge{ level, std::min(L.lo,R.lo), std::max(L.hi,R.hi), shared,
+        S.s, (n > 0) ? (double) fit.n_inl / n : 0.0, (double) n / ((double) shared * P), fit.resid });
+
+    tree_apply_sim_cloud(R.cloud, S);
+    for (auto & a : R.fpts) tree_apply_sim_pts(a, S);
+    ONode m; m.lo = std::min(L.lo, R.lo); m.hi = std::max(L.hi, R.hi);
+    const int F = m.hi - m.lo + 1;
+    m.fpts.assign(F, {}); m.fmsk.assign(F, {});
+    for (int f = L.lo; f <= L.hi; f++) { m.fpts[f-m.lo] = std::move(L.fpts[f-L.lo]); m.fmsk[f-m.lo] = std::move(L.fmsk[f-L.lo]); }
+    for (int f = R.lo; f <= R.hi; f++) if (m.fpts[f-m.lo].empty()) { m.fpts[f-m.lo] = std::move(R.fpts[f-R.lo]); m.fmsk[f-m.lo] = std::move(R.fmsk[f-R.lo]); }
+    m.cloud = std::move(L.cloud);
+    m.cloud.insert(m.cloud.end(), R.cloud.begin(), R.cloud.end());
+    return m;
+}
+
+std::vector<AccumPoint> tree_accumulate_overlap(const std::vector<const float *> & pairs,
+                                                int H, int W, int gc, double thr,
+                                                int block, int overlap,
+                                                double rthr, int riters, uint64_t seed,
+                                                std::vector<TreeMerge> * merges,
+                                                int max_levels, double layout_spacing,
+                                                int * n_nodes_out, int per_node_cap) {
+    const int P = H * W;
+    const int M = (int) pairs.size();
+    if (n_nodes_out) *n_nodes_out = 0;
+    if (M < 1) return {};
+    const int nframes = M + 1;
+    overlap = std::max(1, overlap);
+    block = std::max(block, overlap + 1);
+    block = std::min(block, nframes);
+    overlap = std::min(overlap, block - 1);
+    const int step = std::max(1, block - overlap);
+
+    // overlapping base submaps: each chains `block-1` consecutive pairs (single-frame
+    // internal links), adjacent submaps share `overlap` frames.
+    std::vector<ONode> nodes;
+    for (int s = 0; s < M; s += step) {
+        const int w = std::min(block, nframes - s);          // frames in this submap
+        if (w < 2) break;
+        ONode nd = opair(pairs[s], s, P, gc, thr);           // frames s, s+1
+        for (int p = s + 1; p <= s + w - 2; p++) {           // fold the rest of the block
+            ONode nx = opair(pairs[p], p, P, gc, thr);
+            nd = omerge(nd, nx, P, rthr, riters, seed, nullptr, -1);
+        }
+        nodes.push_back(std::move(nd));
+        if (s + block >= nframes) break;                     // last submap reached the end
+    }
+
+    // median base-submap extent — the auto layout pitch for side-by-side stages.
+    // Only the auto-layout (layout_spacing<0, staged demo) path reads it, so the
+    // full-merge callers skip these two passes over every submap.
+    double leaf_extent = 1.0;
+    if (layout_spacing < 0.0) {
+        std::vector<double> ex;
+        for (auto & nd : nodes) {
+            double m[3] = {0,0,0}; int64_t nf = 0;
+            for (auto & p : nd.cloud) if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z)) {
+                m[0]+=p.x; m[1]+=p.y; m[2]+=p.z; nf++; }
+            if (nf == 0) continue;
+            for (int c = 0; c < 3; c++) m[c] /= nf;
+            double ss = 0;
+            for (auto & p : nd.cloud) if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z)) {
+                double dx=p.x-m[0], dy=p.y-m[1], dz=p.z-m[2]; ss += dx*dx+dy*dy+dz*dz; }
+            ex.push_back(std::sqrt(ss / nf));
+        }
+        if (!ex.empty()) { std::sort(ex.begin(), ex.end()); leaf_extent = ex[ex.size()/2]; }
+    }
+
+    // balanced tree-merge of submaps; each merge fits over the overlap band. Stop
+    // after max_levels rounds (-1 = fully to the root) for the staged demo.
+    int level = 0;
+    while (nodes.size() > 1 && (max_levels < 0 || level < max_levels)) {
+        std::vector<ONode> nxt;
+        nxt.reserve(nodes.size()/2 + 1);
+        for (size_t i = 0; i + 1 < nodes.size(); i += 2)
+            nxt.push_back(omerge(nodes[i], nodes[i+1], P, rthr, riters, seed, merges, level));
+        if (nodes.size() % 2 == 1) nxt.push_back(std::move(nodes.back()));
+        nodes = std::move(nxt); level++;
+    }
+    if (n_nodes_out) *n_nodes_out = (int) nodes.size();
+    if (nodes.empty()) return {};
+
+    // concatenate remaining nodes, laid out side by side (layout_spacing != 0) and
+    // capped per node (opacity*radius) — same as tree_accumulate.
+    const double sigma = (layout_spacing < 0.0) ? 4.0 * leaf_extent : layout_spacing;
+    const double gcentre = 0.5 * M;
+    auto importance = [](const AccumPoint & p) -> double {
+        const double vol = (double) std::max(p.sx,1e-9f) * std::max(p.sy,1e-9f) * std::max(p.sz,1e-9f);
+        return (double) std::max(p.opacity, 0.0f) * std::cbrt(vol);
+    };
+    std::vector<AccumPoint> out;
+    size_t total = 0;
+    for (auto & nd : nodes)
+        total += (per_node_cap > 0) ? std::min((size_t) per_node_cap, nd.cloud.size()) : nd.cloud.size();
+    out.reserve(total);
+    for (auto & nd : nodes) {
+        const double dx = (sigma != 0.0) ? (0.5 * (nd.lo + nd.hi) - gcentre) * sigma : 0.0;
+        if (per_node_cap > 0 && (int) nd.cloud.size() > per_node_cap) {  // keep each scene's own detail
+            std::vector<size_t> idx(nd.cloud.size());
+            for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
+            std::partial_sort(idx.begin(), idx.begin() + per_node_cap, idx.end(),
+                [&](size_t a, size_t b){ return importance(nd.cloud[a]) > importance(nd.cloud[b]); });
+            for (int i = 0; i < per_node_cap; i++) { AccumPoint p = nd.cloud[idx[i]]; p.x = (float) (p.x + dx); out.push_back(p); }
+        } else {
+            for (const auto & src : nd.cloud) { AccumPoint p = src; p.x = (float) (p.x + dx); out.push_back(p); }
+        }
+    }
+    return out;
+}
+
 // ---- consensus fusion -----------------------------------------------------
 
 FuseStats consensus_fuse(const std::vector<AccumPoint> & cloud, double voxel_frac, int k,

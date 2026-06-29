@@ -206,6 +206,46 @@ private:
     int next_frame_ = 0;
 };
 
+// ---- hierarchical tree accumulation (balanced binary merge) ----------------
+// Linear chaining composes N Sim(3)s in series, so registration drift compounds
+// over N hops and piles onto the last frame (the far end smears). This instead
+// builds short submaps and merges them pairwise up a balanced binary tree — so
+// drift compounds over only ~log2(N) hops and is spread evenly rather than dumped
+// on the end.
+struct TreeMerge {                 // diagnostics per merge (defs as ChainLink)
+    int level, lo_frame, hi_frame, shared_frame;
+    double scale, inlier_frac, valid_frac, resid_frac;
+};
+
+// Multi-frame-overlap tree. pairs[k]: one engine output [2*H*W*gc] (pair k = frames
+// k,k+1; pair k's view-1 and pair k+1's view-0 are the same physical frame).
+// Adjacent submaps of `block` frames overlap by `overlap` frames and each merge fits
+// its Sim(3) over ALL shared frames at once — the fit is over-determined, so the
+// per-frame depth-inconsistency noise (the reason a single-frame alignment is only
+// ~13% rigid-consistent) averages out and the compounded drift drops. Base submaps
+// are short windows of `block` frames (block > overlap), chained internally by
+// single-frame links, then merged in a balanced tree on their overlap bands. The
+// degenerate block=2,overlap=1 is the plain overlap-by-one (single shared boundary)
+// tree. Returns the merged root cloud in the first submap's frame; `merges`
+// (optional) gets one entry per merge.
+//
+// For the staged side-by-side demo: max_levels caps the merge rounds (-1 = full):
+// 0 returns the independent base submaps, 1 the first merge round, ... . The
+// remaining (>1) nodes are shifted apart along X by their frame-range midpoint when
+// layout_spacing != 0 (0 = none, <0 = auto 4x median submap extent, >0 = that
+// spacing), each capped to its top per_node_cap points by opacity*radius (0 =
+// uncapped) so every laid-out scene renders at its own detail. n_nodes_out
+// (optional) reports how many nodes remain (1 once fully merged).
+std::vector<AccumPoint> tree_accumulate_overlap(const std::vector<const float *> & pairs,
+                                                int H, int W, int gaussian_channels,
+                                                double opacity_threshold = 0.05,
+                                                int block = 4, int overlap = 2,
+                                                double ransac_thresh_frac = 0.02,
+                                                int ransac_iters = 300, uint64_t seed = 0,
+                                                std::vector<TreeMerge> * merges = nullptr,
+                                                int max_levels = -1, double layout_spacing = 0.0,
+                                                int * n_nodes_out = nullptr, int per_node_cap = 0);
+
 // ---- consensus fusion (mirrors fuse.py) -----------------------------------
 struct FuseStats {
     int64_t raw_points, voxels, kept_voxels, points_kept, points_dropped;
